@@ -1,6 +1,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- API 34+: CredentialManager.setOrigin(https://rpId) for WebAuthn passkeys linked to your domain -->
+    <uses-permission android:name="android.permission.CREDENTIAL_MANAGER_SET_ORIGIN" />
 
     <!-- Allow app to open https URLs (e.g. OAuth in browser) on Android 11+ -->
     <queries>
@@ -30,8 +32,15 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
-        <!-- Do NOT capture https://signer.abstraxn.com - let auth and callback URLs open in browser.
-             App only opens when backend redirects to myabstraxnapp:// (see intent-filter below). -->
+        <!-- Digital Asset Links / passkeys: Android must verify this domain so Credential Manager can
+             associate the app with RP signer.abstraxn.com (see assetlinks.json get_login_creds).
+             OAuth still uses in-app browser or myabstraxnapp://; this filter enables verification only. -->
+        <intent-filter android:autoVerify="true">
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.DEFAULT" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" android:host="signer.abstraxn.com" />
+        </intent-filter>
         <!-- OAuth redirect: open app when redirected to myabstraxnapp:// -->
         <intent-filter>
             <action android:name="android.intent.action.VIEW" />

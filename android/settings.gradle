@@ -1,6 +1,13 @@
 pluginManagement { includeBuild("../node_modules/@react-native/gradle-plugin") }
 plugins { id("com.facebook.react.settings") }
-extensions.configure(com.facebook.react.ReactSettingsExtension){ ex -> ex.autolinkLibrariesFromCommand() }
+extensions.configure(com.facebook.react.ReactSettingsExtension){ ex ->
+    ex.autolinkLibrariesFromCommand([
+            "/Users/user/.nvm/versions/node/v21.5.0/bin/node",
+            "/Users/user/.nvm/versions/node/v21.5.0/bin/npx",
+            "react-native",
+            "config"
+    ])
+}
 rootProject.name = 'MyAbstraxnApp'
 include ':app'
 includeBuild('../node_modules/@react-native/gradle-plugin')

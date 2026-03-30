@@ -11,32 +11,109 @@ import {
   Alert,
   useWindowDimensions,
   ScrollView,
+  Platform,
 } from 'react-native';
 import FontAwesome5 from 'react-native-vector-icons/FontAwesome5';
 import InAppBrowser from 'react-native-inappbrowser-reborn';
+import { Passkey } from 'react-native-passkey';
+import { Buffer } from 'buffer';
 import {
   AbstraxnProvider,
   SignTransactionButton,
   SignAndSendTransactionButton,
   useAbstraxnWallet,
 } from '@abstraxn/signer-react-native';
+import { base64StringToBase64UrlEncodedString } from '@turnkey/encoding';
+import { SafeAreaView } from 'react-native-safe-area-context';
+
+/**
+ * Minimal WebAuthn assertion challenge: 32 random bytes → base64url.
+ * Per react-native-passkey README: "The challenge inside the request needs to be a base64URL encoded string".
+ * `react-native-get-random-values` is imported from index.js (crypto.getRandomValues).
+ */
+function randomWebAuthnChallengeBase64Url() {
+  const c = globalThis.crypto;
+  if (!c?.getRandomValues) {
+    throw new Error(
+      'crypto.getRandomValues missing — ensure index.js imports react-native-get-random-values first.',
+    );
+  }
+  const bytes = new Uint8Array(32);
+  c.getRandomValues(bytes);
+  const b64 = Buffer.from(bytes).toString('base64');
+  return base64StringToBase64UrlEncodedString(b64);
+}
+
+/** Probe-only: no crypto.getRandomValues (can hang on some devices). 32 bytes → base64url. */
+function probeChallengeBase64Url() {
+  const bytes = new Uint8Array(32);
+  for (let i = 0; i < 32; i++) bytes[i] = i;
+  return base64StringToBase64UrlEncodedString(
+    Buffer.from(bytes).toString('base64'),
+  );
+}
 
 // Redirect scheme for OAuth: backend redirects to myabstraxnapp://success=true&user=...
 const OAUTH_REDIRECT_SCHEME = 'myabstraxnapp://';
+const API_BASE_URL = 'https://signer.abstraxn.com';
+const APP_API_KEY = 'OG3B8vk99Ev3mxRfgToPCNkrT0A0LNI3';
 const GOOGLE_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/google/callback';
 const DISCORD_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/discord/callback';
 const TWITTER_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/x/callback';
+
+function buildOAuthFallbackUrl(providerPath) {
+  const base = `${API_BASE_URL}${providerPath}`;
+  const query = [
+    `apikey=${encodeURIComponent(APP_API_KEY)}`,
+    `origin=${encodeURIComponent(OAUTH_REDIRECT_SCHEME)}`,
+  ].join('&');
+  return `${base}?${query}`;
+}
+
+function normalizeProvider(value) {
+  const v = String(value ?? '')
+    .toLowerCase()
+    .trim();
+  if (v === 'x' || v === 'twitter') return 'twitter';
+  if (v === 'discord') return 'discord';
+  return 'google';
+}
+
+function detectOAuthProvider(url, params, fallbackProvider = 'google') {
+  if (url.includes(TWITTER_CALLBACK_URL_PATH)) return 'twitter';
+  if (url.includes(DISCORD_CALLBACK_URL_PATH)) return 'discord';
+  if (url.includes(GOOGLE_CALLBACK_URL_PATH)) return 'google';
+  const paramProvider =
+    params?.get('provider') ??
+    params?.get('authProvider') ??
+    params?.get('authMethod') ??
+    params?.get('method');
+  if (paramProvider) return normalizeProvider(paramProvider);
+  return normalizeProvider(fallbackProvider);
+}
 
 function getSearchParams(url) {
   if (!url) return null;
   try {
     const parsed = new URL(url);
-    return parsed.searchParams;
+    // Some OAuth providers return params in hash fragment on mobile redirects.
+    if (parsed.searchParams?.toString()) return parsed.searchParams;
+    if (parsed.hash) {
+      const hashQuery = parsed.hash.replace(/^#\/?/, '');
+      return hashQuery ? new URLSearchParams(hashQuery) : null;
+    }
+    return null;
   } catch {
     const qs = url.includes('?')
       ? url.split('?')[1]
       : url.replace(/^[^?]*\/\/?/, '');
-    return qs ? new URLSearchParams(qs) : null;
+    if (qs) return new URLSearchParams(qs);
+    const hashIdx = url.indexOf('#');
+    if (hashIdx >= 0) {
+      const hashQuery = url.slice(hashIdx + 1).replace(/^\/?/, '');
+      return hashQuery ? new URLSearchParams(hashQuery) : null;
+    }
+    return null;
   }
 }
 
@@ -58,7 +135,10 @@ function WalletSection() {
     showOnboarding,
     getGoogleAuthUrl,
     handleGoogleCallback,
+    handleDiscordCallback,
+    handleTwitterCallback,
     completeOAuthFromDeepLink,
+    completeOAuthReturnFromUrl,
     getDiscordAuthUrl,
     getTwitterAuthUrl,
     loading,
@@ -73,6 +153,7 @@ function WalletSection() {
   const [passkeyError, setPasskeyError] = React.useState(null);
   // Dedupe: Google/Discord auth codes are single-use; prevent processing same code twice (avoids invalid_grant)
   const processedCallbackRef = React.useRef(null);
+  const activeOAuthProviderRef = React.useRef('google');
 
   const { width: screenWidth } = useWindowDimensions();
   const cardMaxWidth = Math.min(400, screenWidth - 32);
@@ -80,6 +161,20 @@ function WalletSection() {
   const socialSize = screenWidth < 360 ? 48 : 56;
   const iconSize = screenWidth < 360 ? 20 : 24;
   const titleFontSize = screenWidth < 360 ? 24 : 28;
+  const setProviderLoading = (provider, value) => {
+    if (provider === 'twitter') setTwitterLoading(value);
+    else if (provider === 'discord') setDiscordLoading(value);
+    else setGoogleLoading(value);
+  };
+
+  /** SFSafariViewController / Chrome tab stays open after myabstraxnapp:// resumes the app — dismiss it. */
+  const dismissInAppOAuthBrowser = () => {
+    try {
+      InAppBrowser.close();
+    } catch (e) {
+      console.warn('[OAuth] InAppBrowser.close:', e?.message ?? e);
+    }
+  };
 
   React.useEffect(() => {
     const handleUrl = ({ url }) => {
@@ -92,6 +187,9 @@ function WalletSection() {
       if (!params) {
         console.log('[OAuth] Skipped: could not parse search params');
         return;
+      }
+      if (url.startsWith(OAUTH_REDIRECT_SCHEME)) {
+        dismissInAppOAuthBrowser();
       }
       const paramKeys = [];
       params.forEach((_, key) => paramKeys.push(key));
@@ -108,6 +206,12 @@ function WalletSection() {
       // Backend redirect: myabstraxnapp://success=true&user=... (or with ?query)
       const success = params.get('success');
       const errorParam = params.get('error');
+      const provider = detectOAuthProvider(
+        url,
+        params,
+        activeOAuthProviderRef.current,
+      );
+      console.log('[OAuth] Detected provider:', provider);
       if (errorParam != null && errorParam !== '') {
         const decodedError = decodeURIComponent(errorParam);
         console.error('[OAuth] Error from backend:', decodedError);
@@ -115,9 +219,11 @@ function WalletSection() {
         return;
       }
       if (success === 'true') {
-        const accessToken = params.get('accessToken');
-        const refreshToken = params.get('refreshToken');
-        const userParam = params.get('user');
+        const accessToken =
+          params.get('accessToken') ?? params.get('access_token');
+        const refreshToken =
+          params.get('refreshToken') ?? params.get('refresh_token');
+        const userParam = params.get('user') ?? params.get('userData');
         const turnkeyPublicKey = params.get('turnkeyPublicKey') ?? undefined;
         console.log(
           '[OAuth] Success branch: accessToken=',
@@ -128,7 +234,7 @@ function WalletSection() {
           !!userParam,
         );
         if (accessToken && refreshToken && userParam) {
-          const dedupeKey = `success:${accessToken.slice(0, 20)}`;
+          const dedupeKey = `success:${provider}:${accessToken.slice(0, 20)}`;
           if (processedCallbackRef.current === dedupeKey) {
             console.warn(
               '[OAuth] Skipping duplicate success callback (already processed)',
@@ -136,7 +242,7 @@ function WalletSection() {
             return;
           }
           processedCallbackRef.current = dedupeKey;
-          setGoogleLoading(true);
+          setProviderLoading(provider, true);
           let userObj;
           try {
             userObj = JSON.parse(decodeURIComponent(userParam));
@@ -144,7 +250,7 @@ function WalletSection() {
             const errMsg = 'Invalid user data from sign-in';
             console.error('[OAuth]', errMsg, e);
             setOauthError(errMsg);
-            setGoogleLoading(false);
+            setProviderLoading(provider, false);
             return;
           }
           console.log('[OAuth] Calling completeOAuthFromDeepLink');
@@ -169,11 +275,33 @@ function WalletSection() {
               setDiscordLoading(false);
               setTwitterLoading(false);
             });
-        } else {
-          console.log(
-            '[OAuth] Success=true but missing accessToken/refreshToken/user; cannot complete login',
-          );
+          return;
         }
+        console.log(
+          '[OAuth] Success=true but missing accessToken/refreshToken/user; falling back to code/state flow',
+        );
+        // Web-parity OAuth flow: success=true + loginCode in URL.
+        setProviderLoading(provider, true);
+        completeOAuthReturnFromUrl(url, provider)
+          .then(user => {
+            console.log('[OAuth] completeOAuthReturnFromUrl done:', !!user);
+          })
+          .catch(e => {
+            const errMsg =
+              e?.message ??
+              `${provider} sign-in failed`.replace(/^./, c => c.toUpperCase());
+            console.error(
+              '[OAuth] completeOAuthReturnFromUrl failed:',
+              errMsg,
+              e,
+            );
+            setOauthError(errMsg);
+          })
+          .finally(() => {
+            setGoogleLoading(false);
+            setDiscordLoading(false);
+            setTwitterLoading(false);
+          });
         return;
       }
 
@@ -186,7 +314,7 @@ function WalletSection() {
         );
         return;
       }
-      const dedupeKey = `code:${code}:${state}`;
+      const dedupeKey = `code:${provider}:${code}:${state}`;
       if (processedCallbackRef.current === dedupeKey) {
         console.warn(
           '[OAuth] Skipping duplicate callback (authorization code already sent to backend; would cause invalid_grant)',
@@ -236,16 +364,28 @@ function WalletSection() {
         url.startsWith(OAUTH_REDIRECT_SCHEME)
       ) {
         console.log(
-          '[OAuth] Sending fresh authorization code to backend for Google (single-use)',
+          `[OAuth] Sending fresh authorization code to backend for ${provider} (single-use)`,
         );
-        setGoogleLoading(true);
-        handleGoogleCallback(code, state)
+        setProviderLoading(provider, true);
+        const callbackPromise =
+          provider === 'twitter'
+            ? handleTwitterCallback(code, state)
+            : provider === 'discord'
+            ? handleDiscordCallback(code, state)
+            : handleGoogleCallback(code, state);
+        callbackPromise
           .catch(e => {
-            const errMsg = e?.message ?? 'Google sign-in failed';
-            console.error('[OAuth] handleGoogleCallback failed:', errMsg, e);
+            const label =
+              provider === 'twitter'
+                ? 'X (Twitter)'
+                : provider === 'discord'
+                ? 'Discord'
+                : 'Google';
+            const errMsg = e?.message ?? `${label} sign-in failed`;
+            console.error(`[OAuth] handle${label}Callback failed:`, errMsg, e);
             setOauthError(errMsg);
           })
-          .finally(() => setGoogleLoading(false));
+          .finally(() => setProviderLoading(provider, false));
       }
     };
 
@@ -257,7 +397,13 @@ function WalletSection() {
       }
     });
     return () => subscription.remove();
-  }, [handleGoogleCallback, completeOAuthFromDeepLink]);
+  }, [
+    handleGoogleCallback,
+    handleDiscordCallback,
+    handleTwitterCallback,
+    completeOAuthFromDeepLink,
+    completeOAuthReturnFromUrl,
+  ]);
 
   const openAuthUrl = async (url, options = {}) => {
     if (await InAppBrowser.isAvailable()) {
@@ -273,6 +419,7 @@ function WalletSection() {
   };
 
   const onGooglePress = async () => {
+    activeOAuthProviderRef.current = 'google';
     setOauthError(null);
     try {
       setGoogleLoading(true);
@@ -291,6 +438,7 @@ function WalletSection() {
   };
 
   const onDiscordPress = async () => {
+    activeOAuthProviderRef.current = 'discord';
     console.log('[OAuth] Discord button pressed');
     setOauthError(null);
     try {
@@ -300,7 +448,10 @@ function WalletSection() {
       if (!discordAuthUrl || !discordAuthUrl.startsWith('http')) {
         throw new Error('Invalid Discord sign-in URL');
       }
-      await Linking.openURL(discordAuthUrl);
+      await openAuthUrl(discordAuthUrl, {
+        toolbarColor: '#5865F2',
+        showTitle: true,
+      });
     } catch (e) {
       const msg = e?.message ?? 'Could not open sign-in';
       console.warn('[OAuth] Discord sign-in error:', msg, e);
@@ -312,14 +463,47 @@ function WalletSection() {
   };
 
   const onTwitterPress = async () => {
+    activeOAuthProviderRef.current = 'twitter';
     console.log('[OAuth] Twitter button pressed');
     setOauthError(null);
     try {
       setTwitterLoading(true);
-      const twitterAuthUrl = await getTwitterAuthUrl(OAUTH_REDIRECT_SCHEME);
+      let twitterAuthUrl;
+      try {
+        twitterAuthUrl = await getTwitterAuthUrl(OAUTH_REDIRECT_SCHEME);
+      } catch (e) {
+        const msg = String(e?.message ?? '');
+        const isNetworkInitError =
+          msg.includes('Network request failed') ||
+          msg.includes('Network error:');
+        if (!isNetworkInitError) {
+          throw e;
+        }
+        // Fallback for Android fetch redirect/network edge-cases on /login/x init.
+        twitterAuthUrl = buildOAuthFallbackUrl('/login/x');
+        console.warn(
+          '[OAuth] getTwitterAuthUrl failed; using direct /login/x fallback URL',
+          msg,
+        );
+      }
       console.log('[OAuth] Got X (Twitter) auth URL, opening...');
       if (!twitterAuthUrl || !twitterAuthUrl.startsWith('http')) {
         throw new Error('Invalid X (Twitter) sign-in URL');
+      }
+      try {
+        const parsed = new URL(twitterAuthUrl);
+        console.log(
+          '[OAuth] X auth URL resolved:',
+          parsed.origin,
+          parsed.pathname,
+        );
+      } catch {
+        console.log('[OAuth] X auth URL resolved (raw):', twitterAuthUrl);
+      }
+      // Prefer external browser for X login; embedded/custom-tab sessions can fail with generic twitter.com errors.
+      const canOpenTwitter = await Linking.canOpenURL(twitterAuthUrl);
+      if (!canOpenTwitter) {
+        throw new Error('Cannot open X (Twitter) sign-in URL');
       }
       await Linking.openURL(twitterAuthUrl);
     } catch (e) {
@@ -337,10 +521,33 @@ function WalletSection() {
     setPasskeyError(null);
     setPasskeyCreateLoading(true);
     try {
-      await wallet.signupWithPasskey({
-        // Leave userName undefined so SDK can generate a unique one (User_<timestamp>)
-        organizationName: 'MyAbstraxnApp',
-      });
+      // Let UI settle before native prompt (improves Android reliability).
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      const shouldRetryOnce = e => {
+        const m = `${e?.message ?? ''} ${e?.error ?? ''}`;
+        return /no create options available|CreateCredentialNoCreateOption|NoActivity|temporarily unavailable|RequestFailed/i.test(
+          m,
+        );
+      };
+      let lastErr;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await wallet.signupWithPasskey({
+            // Leave userName undefined so SDK can generate a unique one (User_<timestamp>)
+            organizationName: 'MyAbstraxnApp',
+          });
+          lastErr = null;
+          break;
+        } catch (e) {
+          lastErr = e;
+          if (attempt === 1 && shouldRetryOnce(e)) {
+            await new Promise(r => setTimeout(r, 300));
+            continue;
+          }
+          throw e;
+        }
+      }
+      if (lastErr) throw lastErr;
     } catch (e) {
       const msg = e?.message ?? 'Create wallet with passkey failed';
       setPasskeyError(msg);
@@ -354,9 +561,20 @@ function WalletSection() {
     setPasskeyError(null);
     setPasskeyImportLoading(true);
     try {
+      // Let UI settle before native prompt (improves Android reliability).
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      // Avoid JS timeouts on Android: Credential Manager can take longer and timeouts cause false failures.
       await wallet.loginWithPasskey();
     } catch (e) {
-      const msg = e?.message ?? 'Import wallet with passkey failed';
+      const code = e?.code ?? e?.error;
+      const base = e?.message ?? 'Import wallet with passkey failed';
+      const msg =
+        code != null && String(code).trim() && String(code) !== String(base)
+          ? `${base} (${String(code).trim()})`
+          : base;
+      if (__DEV__) {
+        console.warn('[Passkey import] failed', { code, message: base, platform: Platform.OS });
+      }
       setPasskeyError(msg);
     } finally {
       setPasskeyImportLoading(false);
@@ -364,12 +582,7 @@ function WalletSection() {
   };
 
   const isSigningIn =
-    googleLoading ||
-    discordLoading ||
-    twitterLoading ||
-    passkeyCreateLoading ||
-    passkeyImportLoading ||
-    loading;
+    googleLoading || discordLoading || twitterLoading || loading;
 
   const onLogoutPress = async () => {
     if (!wallet) return;
@@ -436,9 +649,25 @@ function WalletSection() {
     !wallet || passkeyCreateLoading || passkeyImportLoading || socialDisabled;
 
   return (
+    // <SafeAreaView style={{}}>
     <View
       style={[styles.screen, !isSigningIn && !isConnected && styles.screenDark]}
     >
+      {!!(oauthError || passkeyError) && (
+        <View
+          style={[
+            styles.errorBanner,
+            Platform.OS === 'ios' && { paddingTop: 40 },
+          ]}
+        >
+          {oauthError ? (
+            <Text style={styles.errorText}>{oauthError}</Text>
+          ) : null}
+          {passkeyError ? (
+            <Text style={styles.errorText}>{passkeyError}</Text>
+          ) : null}
+        </View>
+      )}
       {isSigningIn ? (
         <View style={styles.signingIn}>
           <ActivityIndicator size="large" color="#5865F2" />
@@ -600,23 +829,17 @@ function WalletSection() {
             )}
           </Pressable>
 
-          {oauthError ? (
-            <Text style={styles.errorText}>{oauthError}</Text>
-          ) : null}
-          {passkeyError ? (
-            <Text style={styles.errorText}>{passkeyError}</Text>
-          ) : null}
-
           <Text style={styles.footer}>Powered by abstraxn</Text>
         </ScrollView>
       )}
     </View>
+    // </SafeAreaView>
   );
 }
 
 export default function App() {
   const config = {
-    apiKey: 'OG3B8vk99Ev3mxRfgToPCNkrT0A0LNI3',
+    apiKey: APP_API_KEY,
     autoConnect: true,
     rpId: 'signer.abstraxn.com', // or your production rpId comment
   };
@@ -646,6 +869,16 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     width: '100%',
     paddingHorizontal: 32,
+  },
+  errorBanner: {
+    position: 'absolute',
+    top: 12,
+    left: 16,
+    right: 16,
+    zIndex: 10000,
+    padding: 10,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0,0,0,0.75)',
   },
   screenDark: {
     backgroundColor: '#1a1a1a',
@@ -773,6 +1006,39 @@ const styles = StyleSheet.create({
     fontSize: 14,
     color: '#9ca3af',
     textDecorationLine: 'underline',
+  },
+  debugLinkWrap: {
+    marginTop: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#374151',
+    alignSelf: 'stretch',
+  },
+  debugLinkText: {
+    textDecorationLine: 'none',
+    color: '#e5e7eb',
+    textAlign: 'center',
+    fontWeight: '600',
+  },
+  debugFloating: {
+    position: 'absolute',
+    bottom: 20,
+    alignSelf: 'center',
+    zIndex: 9999,
+    elevation: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#4b5563',
+  },
+  debugFloatingText: {
+    color: '#f9fafb',
+    fontSize: 13,
+    fontWeight: '700',
   },
   footer: {
     marginTop: 32,

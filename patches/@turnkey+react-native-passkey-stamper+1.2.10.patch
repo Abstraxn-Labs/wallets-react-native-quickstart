@@ -1,0 +1,51 @@
+diff --git a/node_modules/@turnkey/react-native-passkey-stamper/dist/index.js b/node_modules/@turnkey/react-native-passkey-stamper/dist/index.js
+index 286c6a5..6061155 100644
+--- a/node_modules/@turnkey/react-native-passkey-stamper/dist/index.js
++++ b/node_modules/@turnkey/react-native-passkey-stamper/dist/index.js
+@@ -94,15 +94,19 @@ class PasskeyStamper {
+         this.forceSecurityKey = !!config.withSecurityKey;
+     }
+     async stamp(payload) {
+-        const challenge = util.getChallengeFromPayload(payload);
++        const challengeRaw = util.getChallengeFromPayload(payload);
++        // WebAuthn / Android Credential Manager expect base64url for `challenge`, not standard base64.
++        const challenge = encoding.base64StringToBase64UrlEncodedString(challengeRaw);
+         const signingOptions = {
+             challenge: challenge,
+             rpId: this.rpId,
+             timeout: this.timeout,
+-            allowCredentials: this.allowCredentials,
+             userVerification: this.userVerification,
+             extensions: this.extensions,
+         };
++        if (this.allowCredentials && this.allowCredentials.length > 0) {
++            signingOptions.allowCredentials = this.allowCredentials;
++        }
+         let passkeyGetfn = this.forcePlatformKey
+             ? reactNativePasskey.Passkey.getPlatformKey
+             : this.forceSecurityKey
+diff --git a/node_modules/@turnkey/react-native-passkey-stamper/dist/index.mjs b/node_modules/@turnkey/react-native-passkey-stamper/dist/index.mjs
+index 13c8f7c..f6d7ac8 100644
+--- a/node_modules/@turnkey/react-native-passkey-stamper/dist/index.mjs
++++ b/node_modules/@turnkey/react-native-passkey-stamper/dist/index.mjs
+@@ -92,15 +92,18 @@ class PasskeyStamper {
+         this.forceSecurityKey = !!config.withSecurityKey;
+     }
+     async stamp(payload) {
+-        const challenge = getChallengeFromPayload(payload);
++        const challengeRaw = getChallengeFromPayload(payload);
++        const challenge = base64StringToBase64UrlEncodedString(challengeRaw);
+         const signingOptions = {
+             challenge: challenge,
+             rpId: this.rpId,
+             timeout: this.timeout,
+-            allowCredentials: this.allowCredentials,
+             userVerification: this.userVerification,
+             extensions: this.extensions,
+         };
++        if (this.allowCredentials && this.allowCredentials.length > 0) {
++            signingOptions.allowCredentials = this.allowCredentials;
++        }
+         let passkeyGetfn = this.forcePlatformKey
+             ? Passkey.getPlatformKey
+             : this.forceSecurityKey
