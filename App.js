@@ -56,7 +56,13 @@ function probeChallengeBase64Url() {
 // Redirect scheme for OAuth: backend redirects to myabstraxnapp://success=true&user=...
 const OAUTH_REDIRECT_SCHEME = 'myabstraxnapp://';
 const API_BASE_URL = 'https://signer.abstraxn.com';
-const APP_API_KEY = 'OG3B8vk99Ev3mxRfgToPCNkrT0A0LNI3';
+const PASSKEY_RP_ID = 'signer.abstraxn.com';
+/** WebAuthn timeout passed to native Passkey.get (ms). */
+const PASSKEY_TEST_NATIVE_TIMEOUT_MS = 30_000;
+/** If native never resolves/reject, fail after this (must be > native timeout). */
+const PASSKEY_TEST_WATCHDOG_MS = 38_000;
+/** Replace with your Abstraxn API key (never commit real keys to a public repo). */
+const APP_API_KEY = 'YOUR_ABSTRAXN_API_KEY';
 const GOOGLE_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/google/callback';
 const DISCORD_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/discord/callback';
 const TWITTER_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/x/callback';
@@ -150,6 +156,7 @@ function WalletSection() {
   const [oauthError, setOauthError] = React.useState(null);
   const [passkeyCreateLoading, setPasskeyCreateLoading] = React.useState(false);
   const [passkeyImportLoading, setPasskeyImportLoading] = React.useState(false);
+  const [passkeyProbeLoading, setPasskeyProbeLoading] = React.useState(false);
   const [passkeyError, setPasskeyError] = React.useState(null);
   // Dedupe: Google/Discord auth codes are single-use; prevent processing same code twice (avoids invalid_grant)
   const processedCallbackRef = React.useRef(null);
@@ -573,11 +580,116 @@ function WalletSection() {
           ? `${base} (${String(code).trim()})`
           : base;
       if (__DEV__) {
-        console.warn('[Passkey import] failed', { code, message: base, platform: Platform.OS });
+        console.warn('[Passkey import] failed', {
+          code,
+          message: base,
+          platform: Platform.OS,
+        });
       }
       setPasskeyError(msg);
     } finally {
       setPasskeyImportLoading(false);
+    }
+  };
+
+  const onTestPasskeyGetPress = async () => {
+    setPasskeyError(null);
+    setPasskeyProbeLoading(true);
+    const t0 = Date.now();
+    console.log('[Passkey.get test] start', {
+      platform: Platform.OS,
+      rpId: PASSKEY_RP_ID,
+    });
+    try {
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      console.log('[Passkey.get test] after rAF', { dtMs: Date.now() - t0 });
+      const challenge = randomWebAuthnChallengeBase64Url();
+      console.log('[Passkey.get test] challenge ready', {
+        length: challenge?.length,
+        preview: typeof challenge === 'string' ? challenge.slice(0, 20) : null,
+        isBase64Url: /^[A-Za-z0-9\-_]+$/.test(challenge ?? ''),
+      });
+      const req = {
+        challenge,
+        rpId: PASSKEY_RP_ID,
+        timeout: PASSKEY_TEST_NATIVE_TIMEOUT_MS,
+        userVerification: 'preferred',
+      };
+      console.log(
+        '[Passkey.get test] calling Passkey.get',
+        JSON.stringify(
+          {
+            rpId: req.rpId,
+            timeout: req.timeout,
+            userVerification: req.userVerification,
+            challengeLength: req.challenge?.length,
+            challengePreview: req.challenge?.slice(0, 20),
+            note: 'discoverable: do not pass allowCredentials',
+          },
+          null,
+          2,
+        ),
+      );
+      console.log('[Passkey.get test] race: native vs watchdog', {
+        nativeTimeoutMs: PASSKEY_TEST_NATIVE_TIMEOUT_MS,
+        watchdogMs: PASSKEY_TEST_WATCHDOG_MS,
+      });
+      const result = await Promise.race([
+        Passkey.get({
+          challenge: req.challenge,
+          rpId: req.rpId,
+          timeout: req.timeout,
+          userVerification: req.userVerification,
+        }).then(v => {
+          console.log('[Passkey.get test] native promise resolved');
+          return v;
+        }),
+        new Promise((_, reject) => {
+          const id = setTimeout(
+            () => {
+              console.warn('[Passkey.get test] watchdog fired — native hung');
+              reject(
+                new Error(
+                  `Passkey.get watchdog (${PASSKEY_TEST_WATCHDOG_MS}ms): native did not resolve/reject. Reload JS bundle, then check adb logcat RNPasskey.`,
+                ),
+              );
+            },
+            PASSKEY_TEST_WATCHDOG_MS,
+          );
+          console.log('[Passkey.get test] watchdog scheduled', {
+            timerId: id,
+            delayMs: PASSKEY_TEST_WATCHDOG_MS,
+          });
+        }),
+      ]);
+      console.log('[Passkey.get test] Passkey.get returned', {
+        dtMs: Date.now() - t0,
+        type: typeof result,
+        hasValue: !!result,
+        idPreview: result?.id ? String(result.id).slice(0, 16) : null,
+      });
+      const credentialId = result?.id
+        ? String(result.id).slice(0, 16)
+        : '(missing)';
+      Alert.alert(
+        'Passkey.get test',
+        `Success. credentialId: ${credentialId}…`,
+      );
+    } catch (e) {
+      const msg = e?.message ?? 'Passkey.get test failed';
+      console.warn('[Passkey.get test] error', {
+        dtMs: Date.now() - t0,
+        code: e?.code ?? e?.error,
+        message: e?.message,
+        name: e?.name,
+        userInfo: e?.userInfo,
+        raw: e,
+      });
+      setPasskeyError(msg);
+      Alert.alert('Passkey.get test', msg);
+    } finally {
+      console.log('[Passkey.get test] finally', { dtMs: Date.now() - t0 });
+      setPasskeyProbeLoading(false);
     }
   };
 
@@ -646,7 +758,11 @@ function WalletSection() {
     passkeyCreateLoading ||
     passkeyImportLoading;
   const passkeyDisabled =
-    !wallet || passkeyCreateLoading || passkeyImportLoading || socialDisabled;
+    !wallet ||
+    passkeyCreateLoading ||
+    passkeyImportLoading ||
+    passkeyProbeLoading ||
+    socialDisabled;
 
   return (
     // <SafeAreaView style={{}}>
@@ -830,6 +946,17 @@ function WalletSection() {
           </Pressable>
 
           <Text style={styles.footer}>Powered by abstraxn</Text>
+          <Pressable
+            style={styles.debugLinkWrap}
+            onPress={onTestPasskeyGetPress}
+            disabled={passkeyDisabled}
+          >
+            {passkeyProbeLoading ? (
+              <ActivityIndicator size="small" color="#e5e7eb" />
+            ) : (
+              <Text style={styles.debugLinkText}>Test Passkey.get</Text>
+            )}
+          </Pressable>
         </ScrollView>
       )}
     </View>
@@ -841,7 +968,7 @@ export default function App() {
   const config = {
     apiKey: APP_API_KEY,
     autoConnect: true,
-    rpId: 'signer.abstraxn.com', // or your production rpId comment
+    rpId: PASSKEY_RP_ID, // or your production rpId comment
   };
 
   return (

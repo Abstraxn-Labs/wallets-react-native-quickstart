@@ -35,6 +35,11 @@ local.properties
 !debug.keystore
 .kotlin/
 
+# Secrets / local env (never commit API keys)
+.env
+.env.*
+!.env.example
+
 # node.js
 #
 node_modules/
