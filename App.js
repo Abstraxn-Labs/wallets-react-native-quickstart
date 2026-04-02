@@ -12,57 +12,23 @@ import {
   useWindowDimensions,
   ScrollView,
   Platform,
+  TextInput,
 } from 'react-native';
 import FontAwesome5 from 'react-native-vector-icons/FontAwesome5';
 import InAppBrowser from 'react-native-inappbrowser-reborn';
-import { Passkey } from 'react-native-passkey';
-import { Buffer } from 'buffer';
-import {
-  AbstraxnProvider,
-  SignTransactionButton,
-  SignAndSendTransactionButton,
-  useAbstraxnWallet,
-} from '@abstraxn/signer-react-native';
-import { base64StringToBase64UrlEncodedString } from '@turnkey/encoding';
-import { SafeAreaView } from 'react-native-safe-area-context';
-
-/**
- * Minimal WebAuthn assertion challenge: 32 random bytes → base64url.
- * Per react-native-passkey README: "The challenge inside the request needs to be a base64URL encoded string".
- * `react-native-get-random-values` is imported from index.js (crypto.getRandomValues).
- */
-function randomWebAuthnChallengeBase64Url() {
-  const c = globalThis.crypto;
-  if (!c?.getRandomValues) {
-    throw new Error(
-      'crypto.getRandomValues missing — ensure index.js imports react-native-get-random-values first.',
-    );
-  }
-  const bytes = new Uint8Array(32);
-  c.getRandomValues(bytes);
-  const b64 = Buffer.from(bytes).toString('base64');
-  return base64StringToBase64UrlEncodedString(b64);
-}
-
-/** Probe-only: no crypto.getRandomValues (can hang on some devices). 32 bytes → base64url. */
-function probeChallengeBase64Url() {
-  const bytes = new Uint8Array(32);
-  for (let i = 0; i < 32; i++) bytes[i] = i;
-  return base64StringToBase64UrlEncodedString(
-    Buffer.from(bytes).toString('base64'),
-  );
-}
+import { ABSTRAXN_API_KEY } from '@env';
+import { AbstraxnProvider, useAbstraxnWallet } from '@abstraxn/signer-react-native';
+import { EmailOtpModal } from './src/EmailOtpModal';
+import { DemoSignTransactionButton } from './components/DemoSignTransactionButton';
+import { DemoSignAndSendTransactionButton } from './components/DemoSignAndSendTransactionButton';
+import { parseEther } from 'viem';
 
 // Redirect scheme for OAuth: backend redirects to myabstraxnapp://success=true&user=...
 const OAUTH_REDIRECT_SCHEME = 'myabstraxnapp://';
 const API_BASE_URL = 'https://signer.abstraxn.com';
 const PASSKEY_RP_ID = 'signer.abstraxn.com';
-/** WebAuthn timeout passed to native Passkey.get (ms). */
-const PASSKEY_TEST_NATIVE_TIMEOUT_MS = 30_000;
-/** If native never resolves/reject, fail after this (must be > native timeout). */
-const PASSKEY_TEST_WATCHDOG_MS = 38_000;
-/** Replace with your Abstraxn API key (never commit real keys to a public repo). */
-const APP_API_KEY = 'YOUR_ABSTRAXN_API_KEY';
+/** Read Abstraxn API key from .env (fallback keeps local dev from crashing). */
+const APP_API_KEY = ABSTRAXN_API_KEY || 'YOUR_ABSTRAXN_API_KEY';
 const GOOGLE_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/google/callback';
 const DISCORD_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/discord/callback';
 const TWITTER_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/x/callback';
@@ -136,9 +102,10 @@ function WalletSection() {
   const {
     isConnected,
     address,
-    wallet,
+    whoami,
+    signupWithPasskeyRN,
+    loginWithPasskeyRN,
     disconnect,
-    showOnboarding,
     getGoogleAuthUrl,
     handleGoogleCallback,
     handleDiscordCallback,
@@ -156,8 +123,9 @@ function WalletSection() {
   const [oauthError, setOauthError] = React.useState(null);
   const [passkeyCreateLoading, setPasskeyCreateLoading] = React.useState(false);
   const [passkeyImportLoading, setPasskeyImportLoading] = React.useState(false);
-  const [passkeyProbeLoading, setPasskeyProbeLoading] = React.useState(false);
   const [passkeyError, setPasskeyError] = React.useState(null);
+  const [emailOnboardingVisible, setEmailOnboardingVisible] = React.useState(false);
+  const [sendAmount, setSendAmount] = React.useState('0.001');
   // Dedupe: Google/Discord auth codes are single-use; prevent processing same code twice (avoids invalid_grant)
   const processedCallbackRef = React.useRef(null);
   const activeOAuthProviderRef = React.useRef('google');
@@ -524,7 +492,6 @@ function WalletSection() {
   };
 
   const onCreatePasskeyPress = async () => {
-    if (!wallet) return;
     setPasskeyError(null);
     setPasskeyCreateLoading(true);
     try {
@@ -539,7 +506,7 @@ function WalletSection() {
       let lastErr;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          await wallet.signupWithPasskey({
+          await signupWithPasskeyRN({
             // Leave userName undefined so SDK can generate a unique one (User_<timestamp>)
             organizationName: 'MyAbstraxnApp',
           });
@@ -564,14 +531,13 @@ function WalletSection() {
   };
 
   const onImportPasskeyPress = async () => {
-    if (!wallet) return;
     setPasskeyError(null);
     setPasskeyImportLoading(true);
     try {
       // Let UI settle before native prompt (improves Android reliability).
       await new Promise(resolve => requestAnimationFrame(resolve));
       // Avoid JS timeouts on Android: Credential Manager can take longer and timeouts cause false failures.
-      await wallet.loginWithPasskey();
+      await loginWithPasskeyRN();
     } catch (e) {
       const code = e?.code ?? e?.error;
       const base = e?.message ?? 'Import wallet with passkey failed';
@@ -592,112 +558,10 @@ function WalletSection() {
     }
   };
 
-  const onTestPasskeyGetPress = async () => {
-    setPasskeyError(null);
-    setPasskeyProbeLoading(true);
-    const t0 = Date.now();
-    console.log('[Passkey.get test] start', {
-      platform: Platform.OS,
-      rpId: PASSKEY_RP_ID,
-    });
-    try {
-      await new Promise(resolve => requestAnimationFrame(resolve));
-      console.log('[Passkey.get test] after rAF', { dtMs: Date.now() - t0 });
-      const challenge = randomWebAuthnChallengeBase64Url();
-      console.log('[Passkey.get test] challenge ready', {
-        length: challenge?.length,
-        preview: typeof challenge === 'string' ? challenge.slice(0, 20) : null,
-        isBase64Url: /^[A-Za-z0-9\-_]+$/.test(challenge ?? ''),
-      });
-      const req = {
-        challenge,
-        rpId: PASSKEY_RP_ID,
-        timeout: PASSKEY_TEST_NATIVE_TIMEOUT_MS,
-        userVerification: 'preferred',
-      };
-      console.log(
-        '[Passkey.get test] calling Passkey.get',
-        JSON.stringify(
-          {
-            rpId: req.rpId,
-            timeout: req.timeout,
-            userVerification: req.userVerification,
-            challengeLength: req.challenge?.length,
-            challengePreview: req.challenge?.slice(0, 20),
-            note: 'discoverable: do not pass allowCredentials',
-          },
-          null,
-          2,
-        ),
-      );
-      console.log('[Passkey.get test] race: native vs watchdog', {
-        nativeTimeoutMs: PASSKEY_TEST_NATIVE_TIMEOUT_MS,
-        watchdogMs: PASSKEY_TEST_WATCHDOG_MS,
-      });
-      const result = await Promise.race([
-        Passkey.get({
-          challenge: req.challenge,
-          rpId: req.rpId,
-          timeout: req.timeout,
-          userVerification: req.userVerification,
-        }).then(v => {
-          console.log('[Passkey.get test] native promise resolved');
-          return v;
-        }),
-        new Promise((_, reject) => {
-          const id = setTimeout(
-            () => {
-              console.warn('[Passkey.get test] watchdog fired — native hung');
-              reject(
-                new Error(
-                  `Passkey.get watchdog (${PASSKEY_TEST_WATCHDOG_MS}ms): native did not resolve/reject. Reload JS bundle, then check adb logcat RNPasskey.`,
-                ),
-              );
-            },
-            PASSKEY_TEST_WATCHDOG_MS,
-          );
-          console.log('[Passkey.get test] watchdog scheduled', {
-            timerId: id,
-            delayMs: PASSKEY_TEST_WATCHDOG_MS,
-          });
-        }),
-      ]);
-      console.log('[Passkey.get test] Passkey.get returned', {
-        dtMs: Date.now() - t0,
-        type: typeof result,
-        hasValue: !!result,
-        idPreview: result?.id ? String(result.id).slice(0, 16) : null,
-      });
-      const credentialId = result?.id
-        ? String(result.id).slice(0, 16)
-        : '(missing)';
-      Alert.alert(
-        'Passkey.get test',
-        `Success. credentialId: ${credentialId}…`,
-      );
-    } catch (e) {
-      const msg = e?.message ?? 'Passkey.get test failed';
-      console.warn('[Passkey.get test] error', {
-        dtMs: Date.now() - t0,
-        code: e?.code ?? e?.error,
-        message: e?.message,
-        name: e?.name,
-        userInfo: e?.userInfo,
-        raw: e,
-      });
-      setPasskeyError(msg);
-      Alert.alert('Passkey.get test', msg);
-    } finally {
-      console.log('[Passkey.get test] finally', { dtMs: Date.now() - t0 });
-      setPasskeyProbeLoading(false);
-    }
-  };
-
   const isSigningIn =
     googleLoading || discordLoading || twitterLoading || loading;
 
   const onLogoutPress = async () => {
-    if (!wallet) return;
     setPasskeyError(null);
     setOauthError(null);
     processedCallbackRef.current = null; // allow next OAuth redirect (e.g. Twitter/Discord re-login) to run completeOAuthFromDeepLink
@@ -708,27 +572,77 @@ function WalletSection() {
     }
   };
 
+  const providerLabel = whoami?.loginProvider
+    ? String(whoami.loginProvider).charAt(0).toUpperCase() +
+      String(whoami.loginProvider).slice(1)
+    : 'Unknown';
+  const evmAddress = whoami?.address ?? address ?? null;
+  const solanaAddress = whoami?.solanaAddress ?? null;
+  const sendAmountWei = React.useMemo(() => {
+    if (!sendAmount || !String(sendAmount).trim()) return null;
+    try {
+      return parseEther(String(sendAmount).trim());
+    } catch {
+      return null;
+    }
+  }, [sendAmount]);
+  const isSendAmountValid = sendAmountWei !== null;
+
   if (isConnected) {
     return (
       <View style={[styles.screen, styles.screenDark]}>
-        <Text style={styles.homeTitle}>You're in</Text>
-        {address ? (
-          <View style={styles.addressContainer}>
-            <Text style={styles.addressText} selectable>
-              {address}
+        <View style={styles.connectedCard}>
+          <Text style={styles.homeTitle}>Welcome back</Text>
+          <Text style={styles.connectedSubtitle}>
+            Signed in via {providerLabel}
+          </Text>
+
+          <View style={styles.walletInfoBlock}>
+            <Text style={styles.walletInfoLabel}>EVM Wallet</Text>
+            <Text style={styles.walletInfoValue} selectable>
+              {evmAddress ?? 'Not available'}
             </Text>
           </View>
-        ) : null}
-        <SignTransactionButton
+          <View style={styles.walletInfoBlock}>
+            <Text style={styles.walletInfoLabel}>Solana Wallet</Text>
+            <Text style={styles.walletInfoValue} selectable>
+              {solanaAddress ?? 'Not available'}
+            </Text>
+          </View>
+          <View style={styles.providerPill}>
+            <Text style={styles.providerPillText}>Provider: {providerLabel}</Text>
+          </View>
+        </View>
+        <DemoSignTransactionButton
+          rpcUrl="https://rpc-amoy.polygon.technology"
           style={styles.connectedPrimaryButton}
           textStyle={styles.connectedPrimaryButtonText}
         />
-        <SignAndSendTransactionButton
+        <View style={styles.amountInputWrap}>
+          <Text style={styles.amountInputLabel}>Amount to send (MATIC)</Text>
+          <TextInput
+            style={styles.amountInput}
+            value={sendAmount}
+            onChangeText={value => setSendAmount(value.replace(/[^0-9.]/g, ''))}
+            placeholder="0.001"
+            placeholderTextColor="#9ca3af"
+            keyboardType="decimal-pad"
+            autoCapitalize="none"
+            autoCorrect={false}
+          />
+          {!isSendAmountValid ? (
+            <Text style={styles.amountInputError}>
+              Enter a valid numeric amount (example: 0.01)
+            </Text>
+          ) : null}
+        </View>
+        <DemoSignAndSendTransactionButton
           rpcUrl="https://rpc-amoy.polygon.technology"
           label="Sign & Send Transaction"
+          disabled={!isSendAmountValid}
           txParams={{
             to: '0x4ECba15A68637CAC139b0A1213a1075632D8b8c5',
-            value: '0x0',
+            value: sendAmountWei ?? 0n,
             data: '0x',
             chainId: 80002,
           }}
@@ -758,10 +672,10 @@ function WalletSection() {
     passkeyCreateLoading ||
     passkeyImportLoading;
   const passkeyDisabled =
-    !wallet ||
+    !signupWithPasskeyRN ||
+    !loginWithPasskeyRN ||
     passkeyCreateLoading ||
     passkeyImportLoading ||
-    passkeyProbeLoading ||
     socialDisabled;
 
   return (
@@ -810,7 +724,7 @@ function WalletSection() {
           <Text style={styles.emailLabel}>Email Address</Text>
           <TouchableOpacity
             style={styles.emailInputRow}
-            onPress={showOnboarding}
+            onPress={() => setEmailOnboardingVisible(true)}
             activeOpacity={0.8}
           >
             <Text style={styles.emailInputIcon}>✉</Text>
@@ -946,19 +860,12 @@ function WalletSection() {
           </Pressable>
 
           <Text style={styles.footer}>Powered by abstraxn</Text>
-          <Pressable
-            style={styles.debugLinkWrap}
-            onPress={onTestPasskeyGetPress}
-            disabled={passkeyDisabled}
-          >
-            {passkeyProbeLoading ? (
-              <ActivityIndicator size="small" color="#e5e7eb" />
-            ) : (
-              <Text style={styles.debugLinkText}>Test Passkey.get</Text>
-            )}
-          </Pressable>
         </ScrollView>
       )}
+      <EmailOtpModal
+        visible={emailOnboardingVisible}
+        onClose={() => setEmailOnboardingVisible(false)}
+      />
     </View>
     // </SafeAreaView>
   );
@@ -1134,39 +1041,6 @@ const styles = StyleSheet.create({
     color: '#9ca3af',
     textDecorationLine: 'underline',
   },
-  debugLinkWrap: {
-    marginTop: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: '#374151',
-    alignSelf: 'stretch',
-  },
-  debugLinkText: {
-    textDecorationLine: 'none',
-    color: '#e5e7eb',
-    textAlign: 'center',
-    fontWeight: '600',
-  },
-  debugFloating: {
-    position: 'absolute',
-    bottom: 20,
-    alignSelf: 'center',
-    zIndex: 9999,
-    elevation: 8,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderRadius: 12,
-    backgroundColor: '#111827',
-    borderWidth: 1,
-    borderColor: '#4b5563',
-  },
-  debugFloatingText: {
-    color: '#f9fafb',
-    fontSize: 13,
-    fontWeight: '700',
-  },
   footer: {
     marginTop: 32,
     fontSize: 12,
@@ -1180,18 +1054,64 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   homeTitle: {
-    fontSize: 20,
+    fontSize: 24,
     fontWeight: '700',
-    marginBottom: 8,
+    marginBottom: 4,
     color: '#f9fafb',
+    textAlign: 'center',
   },
-  addressContainer: {
+  connectedSubtitle: {
+    color: '#9ca3af',
+    fontSize: 14,
+    marginBottom: 18,
+    textAlign: 'center',
+  },
+  connectedCard: {
+    width: '100%',
+    backgroundColor: '#202634',
+    borderWidth: 1,
+    borderColor: '#374151',
+    borderRadius: 16,
+    paddingVertical: 18,
+    paddingHorizontal: 16,
+    marginBottom: 12,
+  },
+  walletInfoBlock: {
     backgroundColor: '#374151',
     borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     alignSelf: 'stretch',
-    maxWidth: '100%',
+    marginTop: 10,
+  },
+  walletInfoLabel: {
+    color: '#d1d5db',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 6,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  walletInfoValue: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '500',
+    textAlign: 'left',
+  },
+  providerPill: {
+    marginTop: 14,
+    alignSelf: 'center',
+    backgroundColor: 'rgba(34, 197, 94, 0.15)',
+    borderColor: 'rgba(34, 197, 94, 0.5)',
+    borderWidth: 1,
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+  },
+  providerPillText: {
+    color: '#86efac',
+    fontSize: 12,
+    fontWeight: '600',
   },
   connectedPrimaryButton: {
     backgroundColor: '#374151',
@@ -1204,11 +1124,32 @@ const styles = StyleSheet.create({
     color: '#f9fafb',
     fontWeight: '600',
   },
-  addressText: {
-    color: '#fff',
-    fontSize: 14,
-    fontWeight: '500',
-    textAlign: 'center',
+  amountInputWrap: {
+    width: '100%',
+    marginTop: 12,
+    marginBottom: 2,
+  },
+  amountInputLabel: {
+    color: '#d1d5db',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  amountInput: {
+    alignSelf: 'stretch',
+    minHeight: 46,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#4b5563',
+    backgroundColor: '#374151',
+    color: '#f9fafb',
+    paddingHorizontal: 12,
+    fontSize: 15,
+  },
+  amountInputError: {
+    marginTop: 6,
+    color: '#fca5a5',
+    fontSize: 12,
   },
   signingIn: {
     alignItems: 'center',

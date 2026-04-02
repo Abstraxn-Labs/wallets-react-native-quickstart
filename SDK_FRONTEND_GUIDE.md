@@ -1,6 +1,6 @@
-# Abstraxn SDK Frontend Guide (Simple + Practical)
+# Frontend notes (this repo)
 
-This guide explains how to use the Abstraxn SDK in a frontend app with a sign-in screen like yours:
+Quick mapping from the MyAbstraxnApp sign-in screen to SDK calls. Not a published doc.
 
 - Email button
 - Google button
@@ -33,14 +33,14 @@ So your frontend mostly needs to:
 Install package:
 
 ```bash
-npm install @abstraxn/signer-react-native
+npm install @abstraxn/signer-core-react-native
 ```
 
-Wrap your app with `AbstraxnProvider`:
+Wrap your app with `WalletProvider` (see `src/WalletContext.jsx` in this repo):
 
 ```tsx
 import React from 'react';
-import { AbstraxnProvider } from '@abstraxn/signer-react-native';
+import { WalletProvider } from './src/WalletContext';
 import MainScreen from './MainScreen';
 
 export default function App() {
@@ -51,9 +51,9 @@ export default function App() {
   };
 
   return (
-    <AbstraxnProvider config={config}>
+    <WalletProvider config={config}>
       <MainScreen />
-    </AbstraxnProvider>
+    </WalletProvider>
   );
 }
 ```
@@ -65,8 +65,11 @@ export default function App() {
 Inside your sign-in screen:
 
 ```tsx
+import { useWallet } from './src/WalletContext';
+
 const {
-  showOnboarding,
+  loginWithOTP,
+  verifyOTP,
   getGoogleAuthUrl,
   getDiscordAuthUrl,
   getTwitterAuthUrl,
@@ -75,7 +78,7 @@ const {
   handleTwitterCallback,
   completeOAuthFromDeepLink,
   wallet,
-} = useAbstraxnWallet();
+} = useWallet();
 ```
 
 `wallet` is used for passkeys:
@@ -89,13 +92,20 @@ const {
 
 ### A) Email row ("Enter your email address")
 
-**Button action:**
+**Button action (recommended):**
 
 ```tsx
-onPress={showOnboarding}
+setEmailModalOpen(true)
 ```
 
-This opens SDK onboarding/email flow.
+Then render a custom OTP modal (this repo uses `EmailOtpModal`) or your own OTP UI:
+
+```tsx
+<EmailOtpModal
+  visible={emailModalOpen}
+  onClose={() => setEmailModalOpen(false)}
+/>
+```
 
 ---
 

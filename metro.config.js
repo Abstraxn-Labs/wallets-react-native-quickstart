@@ -45,11 +45,10 @@ const config = {
     ...defaultConfig.resolver,
     nodeModulesPaths: [
       appNodeModules,
-      path.resolve(monorepoRoot, 'abstraxn-sdks/signer-react-native/node_modules'),
       path.resolve(monorepoRoot, 'abstraxn-sdks/signer-core-react-native/node_modules'),
     ],
     resolveRequest: (context, moduleName, platform) => {
-      // Force a single React instance so hooks (useState, etc.) work in @abstraxn/signer-react-native
+      // Force a single React instance so hooks (useState, etc.) work with linked packages
       if (moduleName === 'react') {
         return { filePath: reactPath, type: 'sourceFile' };
       }
