@@ -13,6 +13,8 @@ import {
   ScrollView,
   Platform,
   TextInput,
+  Modal,
+  Image,
 } from 'react-native';
 import FontAwesome5 from 'react-native-vector-icons/FontAwesome5';
 import InAppBrowser from 'react-native-inappbrowser-reborn';
@@ -21,6 +23,7 @@ import { AbstraxnProvider, useAbstraxnWallet } from '@abstraxn/signer-react-nati
 import { EmailOtpModal } from './src/EmailOtpModal';
 import { DemoSignTransactionButton } from './components/DemoSignTransactionButton';
 import { DemoSignAndSendTransactionButton } from './components/DemoSignAndSendTransactionButton';
+import { normalizeError } from './src/utils/errorMessages';
 import { parseEther } from 'viem';
 
 // Redirect scheme for OAuth: backend redirects to myabstraxnapp://success=true&user=...
@@ -105,6 +108,13 @@ function WalletSection() {
     whoami,
     signupWithPasskeyRN,
     loginWithPasskeyRN,
+    connect,
+    refreshWhoami,
+    verifyMfa,
+    getMfaStatus,
+    enableMfa,
+    verifySetupMfa,
+    disableMfaWithSignedPayload,
     disconnect,
     getGoogleAuthUrl,
     handleGoogleCallback,
@@ -125,6 +135,23 @@ function WalletSection() {
   const [passkeyImportLoading, setPasskeyImportLoading] = React.useState(false);
   const [passkeyError, setPasskeyError] = React.useState(null);
   const [emailOnboardingVisible, setEmailOnboardingVisible] = React.useState(false);
+  const [mfaPromptVisible, setMfaPromptVisible] = React.useState(false);
+  const [mfaCode, setMfaCode] = React.useState('');
+  const [mfaLoading, setMfaLoading] = React.useState(false);
+  const [mfaError, setMfaError] = React.useState(null);
+  const [pendingAuthSource, setPendingAuthSource] = React.useState(null);
+  const [mfaStatus, setMfaStatus] = React.useState(null);
+  const [mfaStatusLoading, setMfaStatusLoading] = React.useState(false);
+  const [mfaManageError, setMfaManageError] = React.useState(null);
+  const [mfaSetupVisible, setMfaSetupVisible] = React.useState(false);
+  const [mfaSetupCode, setMfaSetupCode] = React.useState('');
+  const [mfaSetupLoading, setMfaSetupLoading] = React.useState(false);
+  const [mfaSetupPayload, setMfaSetupPayload] = React.useState(null);
+  const [mfaBackupCodesVisible, setMfaBackupCodesVisible] = React.useState(false);
+  const [mfaBackupCodes, setMfaBackupCodes] = React.useState([]);
+  const [mfaDisableVisible, setMfaDisableVisible] = React.useState(false);
+  const [mfaDisableCode, setMfaDisableCode] = React.useState('');
+  const [mfaDisableLoading, setMfaDisableLoading] = React.useState(false);
   const [sendAmount, setSendAmount] = React.useState('0.001');
   // Dedupe: Google/Discord auth codes are single-use; prevent processing same code twice (avoids invalid_grant)
   const processedCallbackRef = React.useRef(null);
@@ -141,6 +168,71 @@ function WalletSection() {
     else if (provider === 'discord') setDiscordLoading(value);
     else setGoogleLoading(value);
   };
+
+  const isMfaCodeValid = React.useMemo(() => {
+    const normalized = mfaCode.trim().toUpperCase();
+    return /^\d{6}$/.test(normalized) || /^[A-Z0-9]{8}$/.test(normalized);
+  }, [mfaCode]);
+
+  const finalizeAuthSession = React.useCallback(async () => {
+    try {
+      await connect();
+    } catch {}
+    try {
+      await refreshWhoami();
+    } catch {}
+    setPendingAuthSource(null);
+  }, [connect, refreshWhoami]);
+
+  const openMfaPrompt = React.useCallback(source => {
+    setPendingAuthSource(source);
+    setMfaCode('');
+    setMfaError(null);
+    setMfaPromptVisible(true);
+  }, []);
+
+  const handleMfaVerify = React.useCallback(async () => {
+    const normalized = mfaCode.trim().toUpperCase();
+    if (!/^\d{6}$/.test(normalized) && !/^[A-Z0-9]{8}$/.test(normalized)) {
+      setMfaError('Please enter a valid 6-digit code or 8-character backup code.');
+      return;
+    }
+    setMfaLoading(true);
+    setMfaError(null);
+    try {
+      await verifyMfa(normalized);
+      await finalizeAuthSession();
+      setMfaPromptVisible(false);
+      setMfaCode('');
+    } catch (e) {
+      setMfaError(
+        normalizeError(e, {
+          fallback: 'MFA verification failed. Please try again.',
+          code: 'ERR_MFA_001',
+        }),
+      );
+    } finally {
+      setMfaLoading(false);
+    }
+  }, [mfaCode, verifyMfa, finalizeAuthSession]);
+
+  const refreshMfaStatus = React.useCallback(async () => {
+    setMfaStatusLoading(true);
+    setMfaManageError(null);
+    try {
+      const status = await getMfaStatus();
+      setMfaStatus(status);
+    } catch (e) {
+      setMfaManageError(
+        normalizeError(e, {
+          fallback: 'Failed to fetch MFA status.',
+          code: 'ERR_MFA_002',
+        }),
+      );
+    } finally {
+      setMfaStatusLoading(false);
+    }
+  }, [getMfaStatus]);
 
   /** SFSafariViewController / Chrome tab stays open after myabstraxnapp:// resumes the app — dismiss it. */
   const dismissInAppOAuthBrowser = () => {
@@ -181,6 +273,7 @@ function WalletSection() {
       // Backend redirect: myabstraxnapp://success=true&user=... (or with ?query)
       const success = params.get('success');
       const errorParam = params.get('error');
+      const mfaRequiredFromUrl = params.get('mfaRequired') === 'true';
       const provider = detectOAuthProvider(
         url,
         params,
@@ -190,7 +283,12 @@ function WalletSection() {
       if (errorParam != null && errorParam !== '') {
         const decodedError = decodeURIComponent(errorParam);
         console.error('[OAuth] Error from backend:', decodedError);
-        setOauthError(decodedError);
+        setOauthError(
+          normalizeError(decodedError, {
+            fallback: 'Sign-in failed. Please try again.',
+            code: 'ERR_AUTH_001',
+          }),
+        );
         return;
       }
       if (success === 'true') {
@@ -224,7 +322,12 @@ function WalletSection() {
           } catch (e) {
             const errMsg = 'Invalid user data from sign-in';
             console.error('[OAuth]', errMsg, e);
-            setOauthError(errMsg);
+            setOauthError(
+              normalizeError(e, {
+                fallback: 'Sign-in failed. Please try again.',
+                code: 'ERR_AUTH_001',
+              }),
+            );
             setProviderLoading(provider, false);
             return;
           }
@@ -235,7 +338,14 @@ function WalletSection() {
             user: userObj,
             turnkeyPublicKey,
           })
-            .then(() => console.log('[OAuth] completeOAuthFromDeepLink done'))
+            .then(async () => {
+              console.log('[OAuth] completeOAuthFromDeepLink done');
+              if (mfaRequiredFromUrl) {
+                openMfaPrompt(`oauth:${provider}`);
+                return;
+              }
+              await finalizeAuthSession();
+            })
             .catch(e => {
               const errMsg = e?.message ?? 'Sign-in failed';
               console.error(
@@ -243,7 +353,12 @@ function WalletSection() {
                 errMsg,
                 e,
               );
-              setOauthError(errMsg);
+              setOauthError(
+                normalizeError(e, {
+                  fallback: 'Sign-in failed. Please try again.',
+                  code: 'ERR_AUTH_001',
+                }),
+              );
             })
             .finally(() => {
               setGoogleLoading(false);
@@ -258,8 +373,13 @@ function WalletSection() {
         // Web-parity OAuth flow: success=true + loginCode in URL.
         setProviderLoading(provider, true);
         completeOAuthReturnFromUrl(url, provider)
-          .then(user => {
+          .then(async user => {
             console.log('[OAuth] completeOAuthReturnFromUrl done:', !!user);
+            if (mfaRequiredFromUrl) {
+              openMfaPrompt(`oauth:${provider}`);
+              return;
+            }
+            await finalizeAuthSession();
           })
           .catch(e => {
             const errMsg =
@@ -270,7 +390,12 @@ function WalletSection() {
               errMsg,
               e,
             );
-            setOauthError(errMsg);
+            setOauthError(
+              normalizeError(e, {
+                fallback: 'Sign-in failed. Please try again.',
+                code: 'ERR_AUTH_001',
+              }),
+            );
           })
           .finally(() => {
             setGoogleLoading(false);
@@ -311,7 +436,12 @@ function WalletSection() {
         setTwitterLoading(true);
         Linking.openURL(url).catch(e => {
           console.error('[OAuth] Failed to open Twitter callback URL:', e);
-          setOauthError(e?.message ?? 'Could not complete X (Twitter) sign-in');
+          setOauthError(
+            normalizeError(e, {
+              fallback: 'Sign-in failed. Please try again.',
+              code: 'ERR_AUTH_001',
+            }),
+          );
           setTwitterLoading(false);
         });
         return;
@@ -328,7 +458,12 @@ function WalletSection() {
         setDiscordLoading(true);
         Linking.openURL(url).catch(e => {
           console.error('[OAuth] Failed to open Discord callback URL:', e);
-          setOauthError(e?.message ?? 'Could not complete Discord sign-in');
+          setOauthError(
+            normalizeError(e, {
+              fallback: 'Sign-in failed. Please try again.',
+              code: 'ERR_AUTH_001',
+            }),
+          );
           setDiscordLoading(false);
         });
         return;
@@ -349,6 +484,13 @@ function WalletSection() {
             ? handleDiscordCallback(code, state)
             : handleGoogleCallback(code, state);
         callbackPromise
+          .then(async () => {
+            if (mfaRequiredFromUrl) {
+              openMfaPrompt(`oauth:${provider}`);
+              return;
+            }
+            await finalizeAuthSession();
+          })
           .catch(e => {
             const label =
               provider === 'twitter'
@@ -358,7 +500,12 @@ function WalletSection() {
                 : 'Google';
             const errMsg = e?.message ?? `${label} sign-in failed`;
             console.error(`[OAuth] handle${label}Callback failed:`, errMsg, e);
-            setOauthError(errMsg);
+            setOauthError(
+              normalizeError(e, {
+                fallback: 'Sign-in failed. Please try again.',
+                code: 'ERR_AUTH_001',
+              }),
+            );
           })
           .finally(() => setProviderLoading(provider, false));
       }
@@ -378,7 +525,17 @@ function WalletSection() {
     handleTwitterCallback,
     completeOAuthFromDeepLink,
     completeOAuthReturnFromUrl,
+    finalizeAuthSession,
+    openMfaPrompt,
   ]);
+
+  React.useEffect(() => {
+    if (isConnected) {
+      refreshMfaStatus();
+    } else {
+      setMfaStatus(null);
+    }
+  }, [isConnected, refreshMfaStatus]);
 
   const openAuthUrl = async (url, options = {}) => {
     if (await InAppBrowser.isAvailable()) {
@@ -406,7 +563,12 @@ function WalletSection() {
     } catch (e) {
       const msg = e?.message ?? 'Could not open sign-in';
       console.warn('Google sign-in error:', msg, e);
-      setOauthError(msg);
+      setOauthError(
+        normalizeError(e, {
+          fallback: 'Could not open sign-in. Please try again.',
+          code: 'ERR_AUTH_002',
+        }),
+      );
     } finally {
       setGoogleLoading(false);
     }
@@ -430,8 +592,12 @@ function WalletSection() {
     } catch (e) {
       const msg = e?.message ?? 'Could not open sign-in';
       console.warn('[OAuth] Discord sign-in error:', msg, e);
-      setOauthError(msg);
-      Alert.alert('Discord sign-in', msg);
+      const userMessage = normalizeError(e, {
+        fallback: 'Could not open sign-in. Please try again.',
+        code: 'ERR_AUTH_002',
+      });
+      setOauthError(userMessage);
+      Alert.alert('Discord sign-in', userMessage);
     } finally {
       setDiscordLoading(false);
     }
@@ -484,8 +650,12 @@ function WalletSection() {
     } catch (e) {
       const msg = e?.message ?? 'Could not open sign-in';
       console.warn('[OAuth] Twitter sign-in error:', msg, e);
-      setOauthError(msg);
-      Alert.alert('X (Twitter) sign-in', msg);
+      const userMessage = normalizeError(e, {
+        fallback: 'Could not open sign-in. Please try again.',
+        code: 'ERR_AUTH_002',
+      });
+      setOauthError(userMessage);
+      Alert.alert('X (Twitter) sign-in', userMessage);
     } finally {
       setTwitterLoading(false);
     }
@@ -506,10 +676,15 @@ function WalletSection() {
       let lastErr;
       for (let attempt = 1; attempt <= 2; attempt++) {
         try {
-          await signupWithPasskeyRN({
+          const session = await signupWithPasskeyRN({
             // Leave userName undefined so SDK can generate a unique one (User_<timestamp>)
             organizationName: 'MyAbstraxnApp',
           });
+          if (session?.mfaRequired) {
+            openMfaPrompt('passkey-signup');
+          } else {
+            await finalizeAuthSession();
+          }
           lastErr = null;
           break;
         } catch (e) {
@@ -523,8 +698,12 @@ function WalletSection() {
       }
       if (lastErr) throw lastErr;
     } catch (e) {
-      const msg = e?.message ?? 'Create wallet with passkey failed';
-      setPasskeyError(msg);
+      setPasskeyError(
+        normalizeError(e, {
+          fallback: 'Passkey setup failed. Please try again.',
+          code: 'ERR_PASSKEY_001',
+        }),
+      );
     } finally {
       setPasskeyCreateLoading(false);
     }
@@ -537,14 +716,15 @@ function WalletSection() {
       // Let UI settle before native prompt (improves Android reliability).
       await new Promise(resolve => requestAnimationFrame(resolve));
       // Avoid JS timeouts on Android: Credential Manager can take longer and timeouts cause false failures.
-      await loginWithPasskeyRN();
+      const session = await loginWithPasskeyRN();
+      if (session?.mfaRequired) {
+        openMfaPrompt('passkey-login');
+      } else {
+        await finalizeAuthSession();
+      }
     } catch (e) {
       const code = e?.code ?? e?.error;
       const base = e?.message ?? 'Import wallet with passkey failed';
-      const msg =
-        code != null && String(code).trim() && String(code) !== String(base)
-          ? `${base} (${String(code).trim()})`
-          : base;
       if (__DEV__) {
         console.warn('[Passkey import] failed', {
           code,
@@ -552,7 +732,12 @@ function WalletSection() {
           platform: Platform.OS,
         });
       }
-      setPasskeyError(msg);
+      setPasskeyError(
+        normalizeError(e, {
+          fallback: 'Passkey sign-in failed. Please try again.',
+          code: 'ERR_PASSKEY_002',
+        }),
+      );
     } finally {
       setPasskeyImportLoading(false);
     }
@@ -569,6 +754,78 @@ function WalletSection() {
       await disconnect();
     } catch (e) {
       console.warn('Logout failed', e);
+    }
+  };
+
+  const onMfaSetupStart = async () => {
+    setMfaManageError(null);
+    setMfaSetupLoading(true);
+    try {
+      const payload = await enableMfa();
+      setMfaSetupPayload(payload);
+      setMfaSetupCode('');
+      setMfaSetupVisible(true);
+    } catch (e) {
+      setMfaManageError(
+        normalizeError(e, {
+          fallback: 'Failed to start MFA setup.',
+          code: 'ERR_MFA_003',
+        }),
+      );
+    } finally {
+      setMfaSetupLoading(false);
+    }
+  };
+
+  const onMfaSetupVerify = async () => {
+    if (mfaSetupCode.trim().length !== 6) {
+      setMfaManageError('Please enter a 6-digit setup code.');
+      return;
+    }
+    setMfaSetupLoading(true);
+    setMfaManageError(null);
+    try {
+      const result = await verifySetupMfa(mfaSetupCode.trim());
+      setMfaBackupCodes(result?.backupCodes ?? []);
+      setMfaSetupVisible(false);
+      setMfaBackupCodesVisible(true);
+      setMfaSetupCode('');
+      await refreshMfaStatus();
+    } catch (e) {
+      setMfaManageError(
+        normalizeError(e, {
+          fallback: 'Failed to verify MFA setup code.',
+          code: 'ERR_MFA_004',
+        }),
+      );
+    } finally {
+      setMfaSetupLoading(false);
+    }
+  };
+
+  const onMfaDisable = async () => {
+    const normalized = mfaDisableCode.trim().toUpperCase();
+    if (!/^\d{6}$/.test(normalized) && !/^[A-Z0-9]{8}$/.test(normalized)) {
+      setMfaManageError('Enter a valid 6-digit code or 8-character backup code.');
+      return;
+    }
+    setMfaDisableLoading(true);
+    setMfaManageError(null);
+    try {
+      await verifyMfa(normalized);
+      await disableMfaWithSignedPayload();
+      setMfaDisableVisible(false);
+      setMfaDisableCode('');
+      await refreshMfaStatus();
+    } catch (e) {
+      setMfaManageError(
+        normalizeError(e, {
+          fallback: 'Failed to disable MFA.',
+          code: 'ERR_MFA_005',
+        }),
+      );
+    } finally {
+      setMfaDisableLoading(false);
     }
   };
 
@@ -590,7 +847,12 @@ function WalletSection() {
 
   if (isConnected) {
     return (
-      <View style={[styles.screen, styles.screenDark]}>
+      <ScrollView
+        style={[styles.screenScroll, styles.screenDark]}
+        contentContainerStyle={styles.connectedScrollContent}
+        showsVerticalScrollIndicator
+        keyboardShouldPersistTaps="handled"
+      >
         <View style={styles.connectedCard}>
           <Text style={styles.homeTitle}>Welcome back</Text>
           <Text style={styles.connectedSubtitle}>
@@ -612,6 +874,46 @@ function WalletSection() {
           <View style={styles.providerPill}>
             <Text style={styles.providerPillText}>Provider: {providerLabel}</Text>
           </View>
+          <View style={styles.mfaStatusWrap}>
+            <Text style={styles.walletInfoLabel}>MFA Status</Text>
+            {mfaStatusLoading ? (
+              <View style={styles.mfaStatusLoadingRow}>
+                <ActivityIndicator size="small" color="#9ca3af" />
+                <Text style={styles.walletInfoValue}>Checking...</Text>
+              </View>
+            ) : (
+              <Text style={styles.walletInfoValue}>
+                {mfaStatus?.enabled ? 'Enabled' : 'Disabled'}
+              </Text>
+            )}
+          </View>
+          <View style={styles.mfaActionRow}>
+            <TouchableOpacity
+              style={styles.mfaActionButton}
+              onPress={onMfaSetupStart}
+              disabled={mfaSetupLoading || mfaDisableLoading || mfaStatus?.enabled}
+            >
+              {mfaSetupLoading ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.mfaActionButtonText}>Setup MFA</Text>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.mfaActionButton}
+              onPress={() => {
+                setMfaManageError(null);
+                setMfaDisableCode('');
+                setMfaDisableVisible(true);
+              }}
+              disabled={mfaDisableLoading || mfaSetupLoading || !mfaStatus?.enabled}
+            >
+              <Text style={styles.mfaActionButtonText}>Disable MFA</Text>
+            </TouchableOpacity>
+          </View>
+          {mfaManageError ? (
+            <Text style={styles.errorText}>{mfaManageError}</Text>
+          ) : null}
         </View>
         <DemoSignTransactionButton
           rpcUrl="https://rpc-amoy.polygon.technology"
@@ -661,7 +963,125 @@ function WalletSection() {
             <Text style={styles.logoutButtonText}>Log out</Text>
           )}
         </TouchableOpacity>
-      </View>
+        <Modal
+          visible={mfaSetupVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setMfaSetupVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Setup MFA</Text>
+              <Text style={styles.modalSubtitle}>Scan this QR in your authenticator app or use the secret.</Text>
+              {!!mfaSetupPayload?.qrCode && (
+                <Image
+                  source={{ uri: mfaSetupPayload.qrCode }}
+                  style={styles.mfaQrImage}
+                  resizeMode="contain"
+                />
+              )}
+              {!!mfaSetupPayload?.secret && (
+                <Text style={styles.modalHint} selectable>Secret: {mfaSetupPayload.secret}</Text>
+              )}
+              <TextInput
+                style={styles.modalInput}
+                value={mfaSetupCode}
+                onChangeText={v => setMfaSetupCode(v.replace(/\D/g, '').slice(0, 6))}
+                keyboardType="number-pad"
+                placeholder="Enter 6-digit setup code"
+                placeholderTextColor="#9ca3af"
+                editable={!mfaSetupLoading}
+              />
+              <TouchableOpacity
+                style={[styles.modalPrimaryButton, (mfaSetupCode.trim().length !== 6 || mfaSetupLoading) && styles.buttonDisabled]}
+                onPress={onMfaSetupVerify}
+                disabled={mfaSetupCode.trim().length !== 6 || mfaSetupLoading}
+              >
+                {mfaSetupLoading ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.modalPrimaryButtonText}>Verify setup</Text>
+                )}
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalSecondaryButton}
+                onPress={() => setMfaSetupVisible(false)}
+                disabled={mfaSetupLoading}
+              >
+                <Text style={styles.modalSecondaryButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+        <Modal
+          visible={mfaBackupCodesVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setMfaBackupCodesVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Backup Codes</Text>
+              <Text style={styles.modalSubtitle}>Save these codes. Each code can be used once.</Text>
+              <Text style={styles.modalHint} selectable>
+                {mfaBackupCodes.length ? mfaBackupCodes.join('\n') : 'No backup codes returned.'}
+              </Text>
+              <TouchableOpacity
+                style={styles.modalPrimaryButton}
+                onPress={() => setMfaBackupCodesVisible(false)}
+              >
+                <Text style={styles.modalPrimaryButtonText}>Done</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+        <Modal
+          visible={mfaDisableVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setMfaDisableVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>Disable MFA</Text>
+              <Text style={styles.modalSubtitle}>
+                Enter MFA code to verify, then disable MFA for this account.
+              </Text>
+              <TextInput
+                style={styles.modalInput}
+                value={mfaDisableCode}
+                onChangeText={v => {
+                  setMfaDisableCode(v.toUpperCase());
+                  setMfaManageError(null);
+                }}
+                autoCapitalize="characters"
+                autoCorrect={false}
+                editable={!mfaDisableLoading}
+                placeholder="123456 or ABCD1234"
+                placeholderTextColor="#9ca3af"
+              />
+              <TouchableOpacity
+                style={[styles.modalPrimaryButton, mfaDisableLoading && styles.buttonDisabled]}
+                onPress={onMfaDisable}
+                disabled={mfaDisableLoading}
+              >
+                {mfaDisableLoading ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.modalPrimaryButtonText}>Verify & Disable</Text>
+                )}
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.modalSecondaryButton}
+                onPress={() => setMfaDisableVisible(false)}
+                disabled={mfaDisableLoading}
+              >
+                <Text style={styles.modalSecondaryButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+      </ScrollView>
     );
   }
 
@@ -670,7 +1090,8 @@ function WalletSection() {
     discordLoading ||
     twitterLoading ||
     passkeyCreateLoading ||
-    passkeyImportLoading;
+    passkeyImportLoading ||
+    mfaLoading;
   const passkeyDisabled =
     !signupWithPasskeyRN ||
     !loginWithPasskeyRN ||
@@ -683,7 +1104,7 @@ function WalletSection() {
     <View
       style={[styles.screen, !isSigningIn && !isConnected && styles.screenDark]}
     >
-      {!!(oauthError || passkeyError) && (
+      {!!(oauthError || passkeyError || mfaError || mfaManageError) && (
         <View
           style={[
             styles.errorBanner,
@@ -695,6 +1116,10 @@ function WalletSection() {
           ) : null}
           {passkeyError ? (
             <Text style={styles.errorText}>{passkeyError}</Text>
+          ) : null}
+          {mfaError ? <Text style={styles.errorText}>{mfaError}</Text> : null}
+          {mfaManageError ? (
+            <Text style={styles.errorText}>{mfaManageError}</Text>
           ) : null}
         </View>
       )}
@@ -865,7 +1290,181 @@ function WalletSection() {
       <EmailOtpModal
         visible={emailOnboardingVisible}
         onClose={() => setEmailOnboardingVisible(false)}
+        onMfaRequired={() => {
+          setEmailOnboardingVisible(false);
+          openMfaPrompt('otp');
+        }}
       />
+      <Modal
+        visible={mfaPromptVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => {
+          if (!mfaLoading) {
+            setMfaPromptVisible(false);
+            setMfaCode('');
+          }
+        }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>MFA Verification</Text>
+            <Text style={styles.modalSubtitle}>
+              Enter your 6-digit authenticator code or 8-character backup code.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              value={mfaCode}
+              onChangeText={v => {
+                setMfaCode(v.toUpperCase());
+                setMfaError(null);
+              }}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              editable={!mfaLoading}
+              placeholder="123456 or ABCD1234"
+              placeholderTextColor="#9ca3af"
+            />
+            <TouchableOpacity
+              style={[styles.modalPrimaryButton, (!isMfaCodeValid || mfaLoading) && styles.buttonDisabled]}
+              onPress={handleMfaVerify}
+              disabled={!isMfaCodeValid || mfaLoading}
+            >
+              {mfaLoading ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.modalPrimaryButtonText}>Verify MFA</Text>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.modalSecondaryButton}
+              onPress={() => {
+                if (mfaLoading) return;
+                setMfaPromptVisible(false);
+                setMfaCode('');
+              }}
+              disabled={mfaLoading}
+            >
+              <Text style={styles.modalSecondaryButtonText}>Close</Text>
+            </TouchableOpacity>
+            <Text style={styles.modalHint}>Pending auth: {pendingAuthSource ?? 'unknown'}</Text>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={mfaSetupVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMfaSetupVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Setup MFA</Text>
+            <Text style={styles.modalSubtitle}>Scan this QR in your authenticator app or use the secret.</Text>
+            {!!mfaSetupPayload?.qrCode && (
+              <Text style={styles.modalHint} selectable>{mfaSetupPayload.qrCode}</Text>
+            )}
+            {!!mfaSetupPayload?.secret && (
+              <Text style={styles.modalHint} selectable>Secret: {mfaSetupPayload.secret}</Text>
+            )}
+            <TextInput
+              style={styles.modalInput}
+              value={mfaSetupCode}
+              onChangeText={v => setMfaSetupCode(v.replace(/\D/g, '').slice(0, 6))}
+              keyboardType="number-pad"
+              placeholder="Enter 6-digit setup code"
+              placeholderTextColor="#9ca3af"
+              editable={!mfaSetupLoading}
+            />
+            <TouchableOpacity
+              style={[styles.modalPrimaryButton, (mfaSetupCode.trim().length !== 6 || mfaSetupLoading) && styles.buttonDisabled]}
+              onPress={onMfaSetupVerify}
+              disabled={mfaSetupCode.trim().length !== 6 || mfaSetupLoading}
+            >
+              {mfaSetupLoading ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.modalPrimaryButtonText}>Verify setup</Text>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.modalSecondaryButton}
+              onPress={() => setMfaSetupVisible(false)}
+              disabled={mfaSetupLoading}
+            >
+              <Text style={styles.modalSecondaryButtonText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={mfaBackupCodesVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMfaBackupCodesVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Backup Codes</Text>
+            <Text style={styles.modalSubtitle}>Save these codes. Each code can be used once.</Text>
+            <Text style={styles.modalHint} selectable>
+              {mfaBackupCodes.length ? mfaBackupCodes.join('\n') : 'No backup codes returned.'}
+            </Text>
+            <TouchableOpacity
+              style={styles.modalPrimaryButton}
+              onPress={() => setMfaBackupCodesVisible(false)}
+            >
+              <Text style={styles.modalPrimaryButtonText}>Done</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+      <Modal
+        visible={mfaDisableVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setMfaDisableVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Disable MFA</Text>
+            <Text style={styles.modalSubtitle}>
+              Enter MFA code to verify, then disable MFA for this account.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              value={mfaDisableCode}
+              onChangeText={v => {
+                setMfaDisableCode(v.toUpperCase());
+                setMfaManageError(null);
+              }}
+              autoCapitalize="characters"
+              autoCorrect={false}
+              editable={!mfaDisableLoading}
+              placeholder="123456 or ABCD1234"
+              placeholderTextColor="#9ca3af"
+            />
+            <TouchableOpacity
+              style={[styles.modalPrimaryButton, mfaDisableLoading && styles.buttonDisabled]}
+              onPress={onMfaDisable}
+              disabled={mfaDisableLoading}
+            >
+              {mfaDisableLoading ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <Text style={styles.modalPrimaryButtonText}>Verify & Disable</Text>
+              )}
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.modalSecondaryButton}
+              onPress={() => setMfaDisableVisible(false)}
+              disabled={mfaDisableLoading}
+            >
+              <Text style={styles.modalSecondaryButtonText}>Close</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
     // </SafeAreaView>
   );
@@ -1179,11 +1778,121 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
   },
+  connectedScrollContent: {
+    flexGrow: 1,
+    width: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 32,
+    paddingVertical: 24,
+  },
   errorText: {
     color: '#ef4444',
     fontSize: 14,
     marginTop: 12,
     textAlign: 'center',
     alignSelf: 'stretch',
+  },
+  mfaStatusWrap: {
+    marginTop: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: '#374151',
+  },
+  mfaActionRow: {
+    marginTop: 12,
+    flexDirection: 'row',
+    gap: 10,
+  },
+  mfaActionButton: {
+    flex: 1,
+    minHeight: 40,
+    borderRadius: 10,
+    backgroundColor: '#111827',
+    borderWidth: 1,
+    borderColor: '#4b5563',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  mfaActionButtonText: {
+    color: '#f9fafb',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 20,
+  },
+  modalCard: {
+    width: '100%',
+    maxWidth: 420,
+    borderRadius: 14,
+    padding: 18,
+    backgroundColor: '#1f2937',
+    borderWidth: 1,
+    borderColor: '#374151',
+  },
+  modalTitle: {
+    color: '#f9fafb',
+    fontSize: 20,
+    fontWeight: '700',
+  },
+  modalSubtitle: {
+    marginTop: 6,
+    color: '#d1d5db',
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  modalInput: {
+    marginTop: 14,
+    borderWidth: 1,
+    borderColor: '#4b5563',
+    borderRadius: 10,
+    minHeight: 44,
+    color: '#fff',
+    paddingHorizontal: 12,
+  },
+  modalPrimaryButton: {
+    marginTop: 12,
+    minHeight: 44,
+    borderRadius: 10,
+    backgroundColor: '#374151',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalPrimaryButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  modalSecondaryButton: {
+    marginTop: 10,
+    minHeight: 40,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalSecondaryButtonText: {
+    color: '#cbd5e1',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  modalHint: {
+    marginTop: 10,
+    color: '#9ca3af',
+    fontSize: 12,
+    lineHeight: 18,
+  },
+  mfaQrImage: {
+    width: 220,
+    height: 220,
+    alignSelf: 'center',
+    marginTop: 14,
+    borderRadius: 8,
+    backgroundColor: '#fff',
   },
 });

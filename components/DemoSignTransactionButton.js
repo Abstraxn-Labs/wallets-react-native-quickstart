@@ -9,6 +9,8 @@ import {
 } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { useAbstraxnWallet, useSignTxn } from '@abstraxn/signer-react-native';
+import { normalizeError } from '../src/utils/errorMessages';
+import { SignMfaModal } from '../src/SignMfaModal';
 
 /** @typedef {import('@abstraxn/signer-react-native').SignTxnParams} SignTxnParams */
 /** @typedef {import('@abstraxn/signer-react-native').SignTxnResult} SignTxnResult */
@@ -31,11 +33,50 @@ export function DemoSignTransactionButton({
   textStyle,
   disabled = false,
 }) {
-  const { isConnected, loading, address } = useAbstraxnWallet();
+  const { isConnected, loading, address, verifySignMfa } = useAbstraxnWallet();
   const { signTxn } = useSignTxn(rpcUrl);
   const [signing, setSigning] = React.useState(false);
   const [signedResult, setSignedResult] = React.useState(null);
+  const [mfaVisible, setMfaVisible] = React.useState(false);
+  const [mfaCode, setMfaCode] = React.useState('');
+  const [mfaLoading, setMfaLoading] = React.useState(false);
+  const [mfaError, setMfaError] = React.useState(null);
+  const [pendingTxToSign, setPendingTxToSign] = React.useState(null);
   const isDisabled = disabled || !isConnected || !address || loading || signing;
+
+  const isSignMfaRequiredError = React.useCallback((err) => {
+    const code = err?.code ?? err?.response?.data?.code;
+    const status = Number(err?.status ?? err?.response?.status ?? 0);
+    const message = String(err?.message ?? err?.response?.data?.message ?? '').toLowerCase();
+    return (
+      code === 'SIGN_MFA_REQUIRED' ||
+      message.includes('sign_mfa_required') ||
+      message.includes('mfa verification required before signing') ||
+      status === 403 ||
+      message.includes('status 403') ||
+      message.includes('forbidden')
+    );
+  }, []);
+
+  const executeSign = React.useCallback(
+    async (txToSign, allowMfaRetry) => {
+      try {
+        const signResult = await signTxn(txToSign);
+        setSignedResult(signResult);
+        return signResult;
+      } catch (err) {
+        if (allowMfaRetry && isSignMfaRequiredError(err)) {
+          setPendingTxToSign(txToSign);
+          setMfaCode('');
+          setMfaError(null);
+          setMfaVisible(true);
+          return null;
+        }
+        throw err;
+      }
+    },
+    [isSignMfaRequiredError, signTxn]
+  );
 
   const handlePress = async () => {
     if (isDisabled || !address) return;
@@ -53,14 +94,47 @@ export function DemoSignTransactionButton({
             ? { gasLimit: tx.gasLimit }
             : tx?.gas,
       };
-      /** @type {SignTxnResult} */
-      const signResult = await signTxn(txToSign);
-      const { signedTransaction } = signResult;
-      setSignedResult(signResult);
+      await executeSign(txToSign, true);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      Alert.alert('Sign failed', message || 'Could not sign transaction.');
+      Alert.alert(
+        'Sign failed',
+        normalizeError(err, {
+          fallback: 'Could not sign transaction. Please try again.',
+          code: 'ERR_TX_002',
+        }),
+      );
     } finally {
+      setSigning(false);
+    }
+  };
+
+  const onSubmitSignMfa = async () => {
+    const code = mfaCode.trim();
+    if (code.length !== 6) {
+      setMfaError('Please enter a valid 6-digit code.');
+      return;
+    }
+    if (!pendingTxToSign) {
+      setMfaError('No pending signing request found. Please try again.');
+      return;
+    }
+    setMfaLoading(true);
+    setMfaError(null);
+    try {
+      await verifySignMfa(code);
+      setMfaVisible(false);
+      setSigning(true);
+      await executeSign(pendingTxToSign, false);
+      setPendingTxToSign(null);
+    } catch (err) {
+      setMfaError(
+        normalizeError(err, {
+          fallback: 'MFA verification failed. Please try again.',
+          code: 'ERR_MFA_SIGN_001',
+        })
+      );
+    } finally {
+      setMfaLoading(false);
       setSigning(false);
     }
   };
@@ -103,6 +177,24 @@ export function DemoSignTransactionButton({
           </TouchableOpacity>
         </View>
       ) : null}
+      <SignMfaModal
+        visible={mfaVisible}
+        code={mfaCode}
+        onChangeCode={(value) => {
+          setMfaCode(value.replace(/\D/g, '').slice(0, 6));
+          setMfaError(null);
+        }}
+        onSubmit={onSubmitSignMfa}
+        onCancel={() => {
+          if (mfaLoading) return;
+          setMfaVisible(false);
+          setPendingTxToSign(null);
+          setMfaCode('');
+          setMfaError(null);
+        }}
+        loading={mfaLoading}
+        error={mfaError}
+      />
     </View>
   );
 }

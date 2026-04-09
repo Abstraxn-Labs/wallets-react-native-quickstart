@@ -15,8 +15,9 @@ import {
 } from 'react-native';
 import { isValidEmail } from '@abstraxn/signer-core-react-native';
 import { useAbstraxnWallet } from '@abstraxn/signer-react-native';
+import { normalizeError } from './utils/errorMessages';
 
-export function EmailOtpModal({ visible, onClose }) {
+export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
   const { loginWithOTP, verifyOTP } = useAbstraxnWallet();
   const [step, setStep] = useState('email');
   const [email, setEmail] = useState('');
@@ -70,7 +71,12 @@ export function EmailOtpModal({ visible, onClose }) {
         });
       }, 1000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to send OTP');
+      setError(
+        normalizeError(err, {
+          fallback: 'Failed to send verification code. Please try again.',
+          code: 'ERR_OTP_001',
+        }),
+      );
     } finally {
       setLoading(false);
     }
@@ -88,18 +94,28 @@ export function EmailOtpModal({ visible, onClose }) {
     setError(null);
     setLoading(true);
     try {
-      await verifyOTP(otpId, otp);
+      const result = await verifyOTP(otpId, otp);
+      if (result?.mfaRequired) {
+        onMfaRequired?.('otp');
+        onClose();
+        return;
+      }
       resetAndClose();
     } catch (err) {
       console.error('[EmailOtpModal] verifyOTP error:', err);
-      setError(err instanceof Error ? err.message : 'Invalid code');
+      setError(
+        normalizeError(err, {
+          fallback: 'Invalid verification code. Please try again.',
+          code: 'ERR_OTP_002',
+        }),
+      );
     } finally {
       setLoading(false);
     }
-  }, [otp, otpId, verifyOTP, resetAndClose]);
+  }, [otp, otpId, verifyOTP, resetAndClose, onClose, onMfaRequired]);
 
   const handleResend = useCallback(async () => {
-    if (resendCooldown > 0) return;
+    if (resendCooldown > 0 || loading) return;
     setError(null);
     setLoading(true);
     try {
@@ -116,11 +132,16 @@ export function EmailOtpModal({ visible, onClose }) {
         });
       }, 1000);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to resend');
+      setError(
+        normalizeError(err, {
+          fallback: 'Failed to resend code. Please try again.',
+          code: 'ERR_OTP_003',
+        }),
+      );
     } finally {
       setLoading(false);
     }
-  }, [email, loginWithOTP, resendCooldown]);
+  }, [email, loginWithOTP, resendCooldown, loading]);
 
   if (!visible) return null;
 
@@ -191,9 +212,9 @@ export function EmailOtpModal({ visible, onClose }) {
                 )}
               </TouchableOpacity>
               <TouchableOpacity
-                style={[styles.resend, resendCooldown > 0 && styles.resendDisabled]}
+                style={[styles.resend, (resendCooldown > 0 || loading) && styles.resendDisabled]}
                 onPress={handleResend}
-                disabled={resendCooldown > 0}
+                disabled={resendCooldown > 0 || loading}
               >
                 <Text style={styles.resendText}>
                   {resendCooldown > 0 ? `Resend code in ${resendCooldown}s` : 'Resend code'}
