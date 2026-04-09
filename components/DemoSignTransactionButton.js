@@ -6,6 +6,7 @@ import {
   ActivityIndicator,
   Alert,
   View,
+  Platform,
 } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { useAbstraxnWallet, useSignTxn } from '@abstraxn/signer-react-native';
@@ -14,6 +15,12 @@ import { SignMfaModal } from '../src/SignMfaModal';
 
 /** @typedef {import('@abstraxn/signer-react-native').SignTxnParams} SignTxnParams */
 /** @typedef {import('@abstraxn/signer-react-native').SignTxnResult} SignTxnResult */
+
+function truncateHex(str, head = 16, tail = 12) {
+  const s = String(str);
+  if (s.length <= head + tail + 3) return s;
+  return `${s.slice(0, head)}…${s.slice(-tail)}`;
+}
 
 const DEFAULT_TX = {
   // Self-transfer demo tx; uses the connected address at runtime.
@@ -164,17 +171,20 @@ export function DemoSignTransactionButton({
 
       {signedResult?.signedTransaction ? (
         <View style={styles.resultCard}>
-          <Text style={styles.resultTitle}>Signed transaction</Text>
+          <View style={styles.resultHeaderRow}>
+            <Text style={styles.resultTitle}>Signed raw transaction</Text>
+            <TouchableOpacity
+              style={styles.copyPill}
+              onPress={onCopyPress}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.copyPillText}>Copy</Text>
+            </TouchableOpacity>
+          </View>
+          <Text style={styles.resultHint}>Full hex is copied — preview below.</Text>
           <Text style={styles.resultValue} selectable>
-            {signedResult.signedTransaction}
+            {truncateHex(signedResult.signedTransaction)}
           </Text>
-          <TouchableOpacity
-            style={styles.copyButton}
-            onPress={onCopyPress}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.copyButtonText}>Copy</Text>
-          </TouchableOpacity>
         </View>
       ) : null}
       <SignMfaModal
@@ -204,13 +214,13 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   button: {
-    borderRadius: 12,
+    borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
     minHeight: 48,
     paddingVertical: 12,
     paddingHorizontal: 20,
-    backgroundColor: '#374151',
+    backgroundColor: '#30363d',
   },
   disabled: {
     opacity: 0.7,
@@ -221,36 +231,45 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   resultCard: {
-    marginTop: 10,
-    borderRadius: 12,
+    marginTop: 14,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#4b5563',
-    backgroundColor: '#202634',
-    padding: 12,
+    borderColor: '#30363d',
+    backgroundColor: '#0d1117',
+    padding: 14,
+  },
+  resultHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 6,
   },
   resultTitle: {
-    color: '#e5e7eb',
-    fontSize: 13,
+    color: '#f0f6fc',
+    fontSize: 14,
     fontWeight: '700',
+  },
+  resultHint: {
+    color: '#6e7681',
+    fontSize: 11,
     marginBottom: 8,
   },
   resultValue: {
-    color: '#f9fafb',
+    color: '#8b949e',
     fontSize: 12,
     lineHeight: 18,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-  copyButton: {
-    marginTop: 10,
-    alignSelf: 'flex-end',
-    backgroundColor: '#374151',
+  copyPill: {
+    backgroundColor: 'rgba(99, 102, 241, 0.2)',
     borderRadius: 8,
-    paddingVertical: 7,
+    paddingVertical: 6,
     paddingHorizontal: 12,
     borderWidth: 1,
-    borderColor: '#6b7280',
+    borderColor: 'rgba(129, 140, 248, 0.45)',
   },
-  copyButtonText: {
-    color: '#f9fafb',
+  copyPillText: {
+    color: '#a5b4fc',
     fontSize: 12,
     fontWeight: '700',
   },

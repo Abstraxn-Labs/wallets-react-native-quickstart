@@ -6,6 +6,8 @@ import {
   ActivityIndicator,
   Alert,
   View,
+  Platform,
+  Linking,
 } from 'react-native';
 import Clipboard from '@react-native-clipboard/clipboard';
 import {
@@ -17,6 +19,12 @@ import { SignMfaModal } from '../src/SignMfaModal';
 
 /** @typedef {import('@abstraxn/signer-react-native').SignAndSendTxnParams} SignAndSendTxnParams */
 /** @typedef {import('@abstraxn/signer-react-native').SignAndSendTxnResult} SignAndSendTxnResult */
+
+function truncateHex(str, head = 10, tail = 10) {
+  const s = String(str);
+  if (s.length <= head + tail + 3) return s;
+  return `${s.slice(0, head)}…${s.slice(-tail)}`;
+}
 
 export function DemoSignAndSendTransactionButton({
   rpcUrl,
@@ -138,6 +146,22 @@ export function DemoSignAndSendTransactionButton({
     Alert.alert('Copied', 'Transaction hash copied to clipboard.');
   };
 
+  const onViewExplorer = async () => {
+    const hash = sendResult?.hash ? String(sendResult.hash) : '';
+    if (!hash) return;
+    const url = `https://amoy.polygonscan.com/tx/${hash}`;
+    try {
+      const canOpen = await Linking.canOpenURL(url);
+      if (!canOpen) {
+        Alert.alert('Could not open', 'No browser available to open the explorer link.');
+        return;
+      }
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert('Could not open', 'Failed to open the explorer link.');
+    }
+  };
+
   return (
     <View style={styles.container}>
       <TouchableOpacity
@@ -157,18 +181,29 @@ export function DemoSignAndSendTransactionButton({
 
       {sendResult?.hash ? (
         <View style={styles.resultCard}>
-          <Text style={styles.resultTitle}>Transaction sent</Text>
+          <View style={styles.resultHeaderRow}>
+            <Text style={styles.resultTitle}>Transaction sent</Text>
+            <View style={styles.resultHeaderActions}>
+              <TouchableOpacity
+                style={styles.explorerPill}
+                onPress={onViewExplorer}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.explorerPillText}>View</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.copyPill}
+                onPress={onCopyHash}
+                activeOpacity={0.8}
+              >
+                <Text style={styles.copyPillText}>Copy hash</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
           <Text style={styles.resultLabel}>Hash</Text>
           <Text style={styles.resultValue} selectable>
-            {sendResult.hash}
+            {truncateHex(sendResult.hash)}
           </Text>
-          <TouchableOpacity
-            style={styles.copyButton}
-            onPress={onCopyHash}
-            activeOpacity={0.8}
-          >
-            <Text style={styles.copyButtonText}>Copy hash</Text>
-          </TouchableOpacity>
         </View>
       ) : null}
       <SignMfaModal
@@ -198,10 +233,10 @@ const styles = StyleSheet.create({
     width: '100%',
   },
   button: {
-    borderRadius: 12,
+    borderRadius: 14,
     alignItems: 'center',
     justifyContent: 'center',
-    minHeight: 48,
+    minHeight: 52,
     paddingVertical: 12,
     paddingHorizontal: 20,
     backgroundColor: '#374151',
@@ -215,42 +250,67 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   resultCard: {
-    marginTop: 10,
-    borderRadius: 12,
+    marginTop: 14,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#4b5563',
-    backgroundColor: '#202634',
-    padding: 12,
+    borderColor: '#30363d',
+    backgroundColor: '#0d1117',
+    padding: 14,
+  },
+  resultHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  resultHeaderActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
   },
   resultTitle: {
-    color: '#e5e7eb',
-    fontSize: 13,
+    color: '#86efac',
+    fontSize: 14,
     fontWeight: '700',
-    marginBottom: 8,
   },
   resultLabel: {
-    color: '#9ca3af',
-    fontSize: 12,
-    marginBottom: 4,
+    color: '#6e7681',
+    fontSize: 11,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 6,
   },
   resultValue: {
-    color: '#f9fafb',
+    color: '#8b949e',
     fontSize: 12,
     lineHeight: 18,
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
   },
-  copyButton: {
-    marginTop: 10,
-    alignSelf: 'flex-end',
-    backgroundColor: '#374151',
+  copyPill: {
+    backgroundColor: 'rgba(99, 102, 241, 0.2)',
     borderRadius: 8,
-    paddingVertical: 7,
+    paddingVertical: 6,
     paddingHorizontal: 12,
     borderWidth: 1,
-    borderColor: '#6b7280',
+    borderColor: 'rgba(129, 140, 248, 0.45)',
   },
-  copyButtonText: {
-    color: '#f9fafb',
+  copyPillText: {
+    color: '#a5b4fc',
     fontSize: 12,
     fontWeight: '700',
+  },
+  explorerPill: {
+    backgroundColor: 'rgba(34, 197, 94, 0.12)',
+    borderRadius: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: 'rgba(52, 211, 153, 0.35)',
+  },
+  explorerPillText: {
+    color: '#86efac',
+    fontSize: 12,
+    fontWeight: '800',
   },
 });

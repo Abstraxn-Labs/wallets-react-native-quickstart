@@ -17,9 +17,16 @@ import {
   Image,
 } from 'react-native';
 import FontAwesome5 from 'react-native-vector-icons/FontAwesome5';
+import Clipboard from '@react-native-clipboard/clipboard';
+import { SafeAreaView, SafeAreaProvider } from 'react-native-safe-area-context';
 import InAppBrowser from 'react-native-inappbrowser-reborn';
 import { ABSTRAXN_API_KEY } from '@env';
-import { AbstraxnProvider, useAbstraxnWallet } from '@abstraxn/signer-react-native';
+import {
+  AbstraxnProvider,
+  useAbstraxnWallet,
+  useEnableMfa,
+  useDisableMfa,
+} from '@abstraxn/signer-react-native';
 import { EmailOtpModal } from './src/EmailOtpModal';
 import { DemoSignTransactionButton } from './components/DemoSignTransactionButton';
 import { DemoSignAndSendTransactionButton } from './components/DemoSignAndSendTransactionButton';
@@ -101,7 +108,17 @@ function isOAuthRedirectUrl(url) {
   return false;
 }
 
+/** Shorten long addresses for display; full value still copyable. */
+function formatAddressShort(addr, head = 8, tail = 6) {
+  if (!addr || typeof addr !== 'string') return '—';
+  const s = addr.trim();
+  if (s.length <= head + tail + 1) return s;
+  return `${s.slice(0, head)}…${s.slice(-tail)}`;
+}
+
 function WalletSection() {
+  const { verifySetupMfaWithSignRetry } = useEnableMfa();
+  const { disableMfaWithSignRetry } = useDisableMfa();
   const {
     isConnected,
     address,
@@ -135,6 +152,8 @@ function WalletSection() {
   const [passkeyImportLoading, setPasskeyImportLoading] = React.useState(false);
   const [passkeyError, setPasskeyError] = React.useState(null);
   const [emailOnboardingVisible, setEmailOnboardingVisible] = React.useState(false);
+  const [emailLoginValue, setEmailLoginValue] = React.useState('');
+  const [emailLoginError, setEmailLoginError] = React.useState(null);
   const [mfaPromptVisible, setMfaPromptVisible] = React.useState(false);
   const [mfaCode, setMfaCode] = React.useState('');
   const [mfaLoading, setMfaLoading] = React.useState(false);
@@ -785,7 +804,10 @@ function WalletSection() {
     setMfaSetupLoading(true);
     setMfaManageError(null);
     try {
-      const result = await verifySetupMfa(mfaSetupCode.trim());
+      const result = await verifySetupMfaWithSignRetry(
+        mfaSetupCode.trim(),
+        mfaSetupCode.trim(),
+      );
       setMfaBackupCodes(result?.backupCodes ?? []);
       setMfaSetupVisible(false);
       setMfaBackupCodesVisible(true);
@@ -813,7 +835,7 @@ function WalletSection() {
     setMfaManageError(null);
     try {
       await verifyMfa(normalized);
-      await disableMfaWithSignedPayload();
+      await disableMfaWithSignRetry(normalized);
       setMfaDisableVisible(false);
       setMfaDisableCode('');
       await refreshMfaStatus();
@@ -828,6 +850,9 @@ function WalletSection() {
       setMfaDisableLoading(false);
     }
   };
+
+  void verifySetupMfa;
+  void disableMfaWithSignedPayload;
 
   const providerLabel = whoami?.loginProvider
     ? String(whoami.loginProvider).charAt(0).toUpperCase() +
@@ -844,125 +869,255 @@ function WalletSection() {
     }
   }, [sendAmount]);
   const isSendAmountValid = sendAmountWei !== null;
+  const isInlineEmailValid = React.useMemo(
+    () => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailLoginValue.trim()),
+    [emailLoginValue],
+  );
+
+  const handleInlineEmailContinue = React.useCallback(() => {
+    if (!isInlineEmailValid) {
+      setEmailLoginError('Enter a valid email address to continue.');
+      return;
+    }
+    setEmailLoginError(null);
+    setEmailOnboardingVisible(true);
+  }, [isInlineEmailValid]);
 
   if (isConnected) {
-    return (
-      <ScrollView
-        style={[styles.screenScroll, styles.screenDark]}
-        contentContainerStyle={styles.connectedScrollContent}
-        showsVerticalScrollIndicator
-        keyboardShouldPersistTaps="handled"
-      >
-        <View style={styles.connectedCard}>
-          <Text style={styles.homeTitle}>Welcome back</Text>
-          <Text style={styles.connectedSubtitle}>
-            Signed in via {providerLabel}
-          </Text>
+    const copyAddress = (value, label) => {
+      if (!value) return;
+      Clipboard.setString(value);
+      Alert.alert('Copied', `${label} copied to clipboard.`);
+    };
 
-          <View style={styles.walletInfoBlock}>
-            <Text style={styles.walletInfoLabel}>EVM Wallet</Text>
-            <Text style={styles.walletInfoValue} selectable>
-              {evmAddress ?? 'Not available'}
-            </Text>
-          </View>
-          <View style={styles.walletInfoBlock}>
-            <Text style={styles.walletInfoLabel}>Solana Wallet</Text>
-            <Text style={styles.walletInfoValue} selectable>
-              {solanaAddress ?? 'Not available'}
-            </Text>
-          </View>
-          <View style={styles.providerPill}>
-            <Text style={styles.providerPillText}>Provider: {providerLabel}</Text>
-          </View>
-          <View style={styles.mfaStatusWrap}>
-            <Text style={styles.walletInfoLabel}>MFA Status</Text>
-            {mfaStatusLoading ? (
-              <View style={styles.mfaStatusLoadingRow}>
-                <ActivityIndicator size="small" color="#9ca3af" />
-                <Text style={styles.walletInfoValue}>Checking...</Text>
-              </View>
-            ) : (
-              <Text style={styles.walletInfoValue}>
-                {mfaStatus?.enabled ? 'Enabled' : 'Disabled'}
-              </Text>
-            )}
-          </View>
-          <View style={styles.mfaActionRow}>
-            <TouchableOpacity
-              style={styles.mfaActionButton}
-              onPress={onMfaSetupStart}
-              disabled={mfaSetupLoading || mfaDisableLoading || mfaStatus?.enabled}
-            >
-              {mfaSetupLoading ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Text style={styles.mfaActionButtonText}>Setup MFA</Text>
-              )}
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={styles.mfaActionButton}
-              onPress={() => {
-                setMfaManageError(null);
-                setMfaDisableCode('');
-                setMfaDisableVisible(true);
-              }}
-              disabled={mfaDisableLoading || mfaSetupLoading || !mfaStatus?.enabled}
-            >
-              <Text style={styles.mfaActionButtonText}>Disable MFA</Text>
-            </TouchableOpacity>
-          </View>
-          {mfaManageError ? (
-            <Text style={styles.errorText}>{mfaManageError}</Text>
-          ) : null}
-        </View>
-        <DemoSignTransactionButton
-          rpcUrl="https://rpc-amoy.polygon.technology"
-          style={styles.connectedPrimaryButton}
-          textStyle={styles.connectedPrimaryButtonText}
-        />
-        <View style={styles.amountInputWrap}>
-          <Text style={styles.amountInputLabel}>Amount to send (MATIC)</Text>
-          <TextInput
-            style={styles.amountInput}
-            value={sendAmount}
-            onChangeText={value => setSendAmount(value.replace(/[^0-9.]/g, ''))}
-            placeholder="0.001"
-            placeholderTextColor="#9ca3af"
-            keyboardType="decimal-pad"
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          {!isSendAmountValid ? (
-            <Text style={styles.amountInputError}>
-              Enter a valid numeric amount (example: 0.01)
-            </Text>
-          ) : null}
-        </View>
-        <DemoSignAndSendTransactionButton
-          rpcUrl="https://rpc-amoy.polygon.technology"
-          label="Sign & Send Transaction"
-          disabled={!isSendAmountValid}
-          txParams={{
-            to: '0x4ECba15A68637CAC139b0A1213a1075632D8b8c5',
-            value: sendAmountWei ?? 0n,
-            data: '0x',
-            chainId: 80002,
-          }}
-          style={styles.connectedPrimaryButton}
-          textStyle={styles.connectedPrimaryButtonText}
-        />
-        <TouchableOpacity
-          style={styles.logoutButton}
-          onPress={onLogoutPress}
-          disabled={disconnecting || loading}
-          activeOpacity={0.7}
+    return (
+      <SafeAreaView
+        style={[styles.screenScroll, styles.screenDark]}
+        edges={['top', 'left', 'right']}
+      >
+        <ScrollView
+          style={styles.screenScroll}
+          contentContainerStyle={styles.connectedScrollContent}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled"
         >
-          {disconnecting ? (
-            <ActivityIndicator size="small" color="#ef4444" />
-          ) : (
-            <Text style={styles.logoutButtonText}>Log out</Text>
-          )}
-        </TouchableOpacity>
+          <View style={styles.connectedHero}>
+            <View style={styles.connectedAvatar}>
+              <FontAwesome5 name="wallet" size={26} color="#a5b4fc" />
+            </View>
+            <Text style={styles.homeTitle}>Welcome back</Text>
+            <Text style={styles.connectedSubtitle}>
+              Signed in with {providerLabel}
+            </Text>
+            <View style={styles.providerPill}>
+              <FontAwesome5 name="shield-alt" size={11} color="#86efac" />
+              <Text style={styles.providerPillText}>{providerLabel}</Text>
+            </View>
+          </View>
+
+          <Text style={styles.connectedSectionTitle}>Wallets</Text>
+          <View style={styles.connectedCard}>
+            <View style={styles.walletRow}>
+              <View style={styles.walletRowIconWrap}>
+                <FontAwesome5 name="ethereum" size={18} color="#627eea" brand />
+              </View>
+              <View style={styles.walletRowBody}>
+                <Text style={styles.walletRowLabel}>Ethereum</Text>
+                <Text style={styles.walletRowMono} selectable>
+                  {evmAddress ? formatAddressShort(evmAddress) : 'Not available'}
+                </Text>
+              </View>
+              {evmAddress ? (
+                <TouchableOpacity
+                  style={styles.walletRowCopy}
+                  onPress={() => copyAddress(evmAddress, 'EVM address')}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="Copy EVM address"
+                >
+                  <FontAwesome5 name="copy" size={15} color="#8b949e" />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+            <View style={styles.walletRowDivider} />
+            <View style={styles.walletRow}>
+              <View
+                style={[styles.walletRowIconWrap, styles.walletRowIconSolana]}
+              >
+                <FontAwesome5 name="sun" size={17} color="#e879f9" />
+              </View>
+              <View style={styles.walletRowBody}>
+                <Text style={styles.walletRowLabel}>Solana</Text>
+                <Text style={styles.walletRowMono} selectable>
+                  {solanaAddress
+                    ? formatAddressShort(solanaAddress, 6, 6)
+                    : 'Not available'}
+                </Text>
+              </View>
+              {solanaAddress ? (
+                <TouchableOpacity
+                  style={styles.walletRowCopy}
+                  onPress={() => copyAddress(solanaAddress, 'Solana address')}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  accessibilityLabel="Copy Solana address"
+                >
+                  <FontAwesome5 name="copy" size={15} color="#8b949e" />
+                </TouchableOpacity>
+              ) : null}
+            </View>
+          </View>
+
+          <Text style={styles.connectedSectionTitle}>Security</Text>
+          <View style={styles.connectedCard}>
+            <View style={styles.mfaHeaderRow}>
+              <Text style={styles.mfaHeaderTitle}>Multi-factor authentication</Text>
+              {mfaStatusLoading ? (
+                <View style={styles.mfaBadgeLoading}>
+                  <ActivityIndicator size="small" color="#8b949e" />
+                </View>
+              ) : (
+                <View
+                  style={[
+                    styles.mfaStatusBadge,
+                    mfaStatus?.enabled
+                      ? styles.mfaStatusBadgeOn
+                      : styles.mfaStatusBadgeOff,
+                  ]}
+                >
+                  <View
+                    style={[
+                      styles.mfaStatusDot,
+                      mfaStatus?.enabled
+                        ? styles.mfaStatusDotOn
+                        : styles.mfaStatusDotOff,
+                    ]}
+                  />
+                  <Text
+                    style={[
+                      styles.mfaStatusBadgeText,
+                      mfaStatus?.enabled
+                        ? styles.mfaStatusBadgeTextOn
+                        : styles.mfaStatusBadgeTextOff,
+                    ]}
+                  >
+                    {mfaStatus?.enabled ? 'On' : 'Off'}
+                  </Text>
+                </View>
+              )}
+            </View>
+            <Text style={styles.mfaHint}>
+              Add an extra layer of protection when signing transactions.
+            </Text>
+            <View style={styles.mfaActionRow}>
+              <TouchableOpacity
+                style={[
+                  styles.mfaPrimaryButton,
+                  (mfaSetupLoading ||
+                    mfaDisableLoading ||
+                    mfaStatus?.enabled) &&
+                    styles.mfaPrimaryButtonDisabled,
+                ]}
+                onPress={onMfaSetupStart}
+                disabled={
+                  mfaSetupLoading || mfaDisableLoading || mfaStatus?.enabled
+                }
+              >
+                {mfaSetupLoading ? (
+                  <ActivityIndicator size="small" color="#0f172a" />
+                ) : (
+                  <Text style={styles.mfaPrimaryButtonText}>Set up MFA</Text>
+                )}
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[
+                  styles.mfaGhostButton,
+                  (mfaDisableLoading ||
+                    mfaSetupLoading ||
+                    !mfaStatus?.enabled) &&
+                    styles.mfaGhostButtonDisabled,
+                ]}
+                onPress={() => {
+                  setMfaManageError(null);
+                  setMfaDisableCode('');
+                  setMfaDisableVisible(true);
+                }}
+                disabled={
+                  mfaDisableLoading || mfaSetupLoading || !mfaStatus?.enabled
+                }
+              >
+                <Text style={styles.mfaGhostButtonText}>Turn off</Text>
+              </TouchableOpacity>
+            </View>
+            {mfaManageError ? (
+              <Text style={styles.errorText}>{mfaManageError}</Text>
+            ) : null}
+          </View>
+
+          <Text style={styles.connectedSectionTitle}>Try a transaction</Text>
+          <Text style={styles.connectedSectionHint}>
+            Demo on Polygon Amoy — sign locally or send MATIC.
+          </Text>
+          <View style={styles.connectedCard}>
+            <DemoSignTransactionButton
+              rpcUrl="https://rpc-amoy.polygon.technology"
+              style={styles.connectedSecondaryButton}
+              textStyle={styles.connectedSecondaryButtonText}
+            />
+            <View style={styles.amountInputWrap}>
+              <Text style={styles.amountInputLabel}>Amount (MATIC)</Text>
+              <TextInput
+                style={styles.amountInput}
+                value={sendAmount}
+                onChangeText={value =>
+                  setSendAmount(value.replace(/[^0-9.]/g, ''))
+                }
+                placeholder="0.001"
+                placeholderTextColor="#6e7681"
+                keyboardType="decimal-pad"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              {!isSendAmountValid ? (
+                <Text style={styles.amountInputError}>
+                  Enter a valid amount (e.g. 0.01)
+                </Text>
+              ) : null}
+            </View>
+            <DemoSignAndSendTransactionButton
+              rpcUrl="https://rpc-amoy.polygon.technology"
+              label="Sign & send"
+              disabled={!isSendAmountValid}
+              txParams={{
+                to: '0x4ECba15A68637CAC139b0A1213a1075632D8b8c5',
+                value: sendAmountWei ?? 0n,
+                data: '0x',
+                chainId: 80002,
+              }}
+              style={styles.connectedPrimaryButton}
+              textStyle={styles.connectedPrimaryButtonText}
+            />
+          </View>
+
+          <TouchableOpacity
+            style={styles.logoutButton}
+            onPress={onLogoutPress}
+            disabled={disconnecting || loading}
+            activeOpacity={0.7}
+          >
+            {disconnecting ? (
+              <ActivityIndicator size="small" color="#f87171" />
+            ) : (
+              <>
+                <FontAwesome5
+                  name="sign-out-alt"
+                  size={15}
+                  color="#f87171"
+                  style={styles.logoutIcon}
+                />
+                <Text style={styles.logoutButtonText}>Log out</Text>
+              </>
+            )}
+          </TouchableOpacity>
+        </ScrollView>
         <Modal
           visible={mfaSetupVisible}
           transparent
@@ -1081,7 +1236,7 @@ function WalletSection() {
             </View>
           </View>
         </Modal>
-      </ScrollView>
+      </SafeAreaView>
     );
   }
 
@@ -1100,9 +1255,9 @@ function WalletSection() {
     socialDisabled;
 
   return (
-    // <SafeAreaView style={{}}>
-    <View
-      style={[styles.screen, !isSigningIn && !isConnected && styles.screenDark]}
+    <SafeAreaView
+      style={[styles.screen, !isConnected && styles.screenDark]}
+      edges={['top', 'bottom', 'left', 'right']}
     >
       {!!(oauthError || passkeyError || mfaError || mfaManageError) && (
         <View
@@ -1111,9 +1266,7 @@ function WalletSection() {
             Platform.OS === 'ios' && { paddingTop: 40 },
           ]}
         >
-          {oauthError ? (
-            <Text style={styles.errorText}>{oauthError}</Text>
-          ) : null}
+          {oauthError ? <Text style={styles.errorText}>{oauthError}</Text> : null}
           {passkeyError ? (
             <Text style={styles.errorText}>{passkeyError}</Text>
           ) : null}
@@ -1123,6 +1276,7 @@ function WalletSection() {
           ) : null}
         </View>
       )}
+
       {isSigningIn ? (
         <View style={styles.signingIn}>
           <ActivityIndicator size="large" color="#5865F2" />
@@ -1131,14 +1285,7 @@ function WalletSection() {
       ) : (
         <ScrollView
           style={styles.screenScroll}
-          contentContainerStyle={[
-            styles.screenSignInScroll,
-            {
-              // maxWidth: cardMaxWidth,
-              // paddingHorizontal: 10,
-              // paddingVertical: 24,
-            },
-          ]}
+          contentContainerStyle={styles.screenSignInScroll}
           keyboardShouldPersistTaps="handled"
           showsVerticalScrollIndicator={false}
         >
@@ -1147,17 +1294,40 @@ function WalletSection() {
           </Text>
 
           <Text style={styles.emailLabel}>Email Address</Text>
-          <TouchableOpacity
-            style={styles.emailInputRow}
-            onPress={() => setEmailOnboardingVisible(true)}
-            activeOpacity={0.8}
-          >
+          <View style={styles.emailInputRow}>
             <Text style={styles.emailInputIcon}>✉</Text>
-            <Text style={styles.emailInputPlaceholder}>
-              Enter your email address
-            </Text>
-            <Text style={styles.emailInputArrow}>→</Text>
-          </TouchableOpacity>
+            <TextInput
+              style={styles.emailInputField}
+              placeholder="Enter your email address"
+              placeholderTextColor="#9ca3af"
+              keyboardType="email-address"
+              autoCapitalize="none"
+              autoCorrect={false}
+              value={emailLoginValue}
+              onChangeText={value => {
+                setEmailLoginValue(value);
+                setEmailLoginError(null);
+              }}
+              returnKeyType="done"
+              onSubmitEditing={handleInlineEmailContinue}
+            />
+            <TouchableOpacity
+              style={[
+                styles.emailInputArrowButton,
+                !isInlineEmailValid && styles.emailInputArrowButtonDisabled,
+              ]}
+              onPress={handleInlineEmailContinue}
+              disabled={!isInlineEmailValid}
+              activeOpacity={0.8}
+              accessibilityRole="button"
+              accessibilityLabel="Continue with email"
+            >
+              <Text style={styles.emailInputArrow}>→</Text>
+            </TouchableOpacity>
+          </View>
+          {emailLoginError ? (
+            <Text style={styles.inlineFieldError}>{emailLoginError}</Text>
+          ) : null}
 
           <View style={styles.dividerRow}>
             <View style={styles.dividerLine} />
@@ -1287,14 +1457,18 @@ function WalletSection() {
           <Text style={styles.footer}>Powered by abstraxn</Text>
         </ScrollView>
       )}
+
       <EmailOtpModal
         visible={emailOnboardingVisible}
+        prefilledEmail={emailLoginValue.trim()}
+        autoSendEmailOnOpen={true}
         onClose={() => setEmailOnboardingVisible(false)}
         onMfaRequired={() => {
           setEmailOnboardingVisible(false);
           openMfaPrompt('otp');
         }}
       />
+
       <Modal
         visible={mfaPromptVisible}
         transparent
@@ -1326,7 +1500,10 @@ function WalletSection() {
               placeholderTextColor="#9ca3af"
             />
             <TouchableOpacity
-              style={[styles.modalPrimaryButton, (!isMfaCodeValid || mfaLoading) && styles.buttonDisabled]}
+              style={[
+                styles.modalPrimaryButton,
+                (!isMfaCodeValid || mfaLoading) && styles.buttonDisabled,
+              ]}
               onPress={handleMfaVerify}
               disabled={!isMfaCodeValid || mfaLoading}
             >
@@ -1347,10 +1524,13 @@ function WalletSection() {
             >
               <Text style={styles.modalSecondaryButtonText}>Close</Text>
             </TouchableOpacity>
-            <Text style={styles.modalHint}>Pending auth: {pendingAuthSource ?? 'unknown'}</Text>
+            <Text style={styles.modalHint}>
+              Pending auth: {pendingAuthSource ?? 'unknown'}
+            </Text>
           </View>
         </View>
       </Modal>
+
       <Modal
         visible={mfaSetupVisible}
         transparent
@@ -1360,24 +1540,36 @@ function WalletSection() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Setup MFA</Text>
-            <Text style={styles.modalSubtitle}>Scan this QR in your authenticator app or use the secret.</Text>
+            <Text style={styles.modalSubtitle}>
+              Scan this QR in your authenticator app or use the secret.
+            </Text>
             {!!mfaSetupPayload?.qrCode && (
-              <Text style={styles.modalHint} selectable>{mfaSetupPayload.qrCode}</Text>
+              <Text style={styles.modalHint} selectable>
+                {mfaSetupPayload.qrCode}
+              </Text>
             )}
             {!!mfaSetupPayload?.secret && (
-              <Text style={styles.modalHint} selectable>Secret: {mfaSetupPayload.secret}</Text>
+              <Text style={styles.modalHint} selectable>
+                Secret: {mfaSetupPayload.secret}
+              </Text>
             )}
             <TextInput
               style={styles.modalInput}
               value={mfaSetupCode}
-              onChangeText={v => setMfaSetupCode(v.replace(/\D/g, '').slice(0, 6))}
+              onChangeText={v =>
+                setMfaSetupCode(v.replace(/\D/g, '').slice(0, 6))
+              }
               keyboardType="number-pad"
               placeholder="Enter 6-digit setup code"
               placeholderTextColor="#9ca3af"
               editable={!mfaSetupLoading}
             />
             <TouchableOpacity
-              style={[styles.modalPrimaryButton, (mfaSetupCode.trim().length !== 6 || mfaSetupLoading) && styles.buttonDisabled]}
+              style={[
+                styles.modalPrimaryButton,
+                (mfaSetupCode.trim().length !== 6 || mfaSetupLoading) &&
+                  styles.buttonDisabled,
+              ]}
               onPress={onMfaSetupVerify}
               disabled={mfaSetupCode.trim().length !== 6 || mfaSetupLoading}
             >
@@ -1397,6 +1589,7 @@ function WalletSection() {
           </View>
         </View>
       </Modal>
+
       <Modal
         visible={mfaBackupCodesVisible}
         transparent
@@ -1406,9 +1599,13 @@ function WalletSection() {
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Backup Codes</Text>
-            <Text style={styles.modalSubtitle}>Save these codes. Each code can be used once.</Text>
+            <Text style={styles.modalSubtitle}>
+              Save these codes. Each code can be used once.
+            </Text>
             <Text style={styles.modalHint} selectable>
-              {mfaBackupCodes.length ? mfaBackupCodes.join('\n') : 'No backup codes returned.'}
+              {mfaBackupCodes.length
+                ? mfaBackupCodes.join('\n')
+                : 'No backup codes returned.'}
             </Text>
             <TouchableOpacity
               style={styles.modalPrimaryButton}
@@ -1419,6 +1616,7 @@ function WalletSection() {
           </View>
         </View>
       </Modal>
+
       <Modal
         visible={mfaDisableVisible}
         transparent
@@ -1445,14 +1643,19 @@ function WalletSection() {
               placeholderTextColor="#9ca3af"
             />
             <TouchableOpacity
-              style={[styles.modalPrimaryButton, mfaDisableLoading && styles.buttonDisabled]}
+              style={[
+                styles.modalPrimaryButton,
+                mfaDisableLoading && styles.buttonDisabled,
+              ]}
               onPress={onMfaDisable}
               disabled={mfaDisableLoading}
             >
               {mfaDisableLoading ? (
                 <ActivityIndicator size="small" color="#fff" />
               ) : (
-                <Text style={styles.modalPrimaryButtonText}>Verify & Disable</Text>
+                <Text style={styles.modalPrimaryButtonText}>
+                  Verify & Disable
+                </Text>
               )}
             </TouchableOpacity>
             <TouchableOpacity
@@ -1465,8 +1668,7 @@ function WalletSection() {
           </View>
         </View>
       </Modal>
-    </View>
-    // </SafeAreaView>
+    </SafeAreaView>
   );
 }
 
@@ -1478,30 +1680,25 @@ export default function App() {
   };
 
   return (
-    <AbstraxnProvider config={config}>
-      <View style={styles.container}>
-        {/* <Text style={styles.title}>MyAbstraxnApp</Text> */}
-        <WalletSection />
-        <StatusBar barStyle="dark-content" />
-      </View>
-    </AbstraxnProvider>
+    <SafeAreaProvider>
+      <AbstraxnProvider config={config}>
+        <View style={styles.container}>
+          <WalletSection />
+          <StatusBar barStyle="light-content" />
+        </View>
+      </AbstraxnProvider>
+    </SafeAreaProvider>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 16,
+    backgroundColor: '#0d1117',
   },
   screen: {
     flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
     width: '100%',
-    paddingHorizontal: 32,
   },
   errorBanner: {
     position: 'absolute',
@@ -1514,7 +1711,7 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.75)',
   },
   screenDark: {
-    backgroundColor: '#1a1a1a',
+    backgroundColor: '#0d1117',
   },
   screenScroll: {
     flex: 1,
@@ -1526,6 +1723,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#1a1a1a',
     width: '100%',
+    paddingHorizontal: 32,
+    paddingVertical: 24,
   },
   signInTitle: {
     fontSize: 28,
@@ -1545,24 +1744,48 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     backgroundColor: '#374151',
     borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 16,
-    marginBottom: 20,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     alignSelf: 'stretch',
+    borderWidth: 1,
+    borderColor: '#4b5563',
   },
   emailInputIcon: {
-    fontSize: 18,
+    fontSize: 15,
     color: '#9ca3af',
-    marginRight: 12,
+    marginRight: 10,
   },
-  emailInputPlaceholder: {
+  emailInputField: {
     flex: 1,
     fontSize: 16,
-    color: '#9ca3af',
+    color: '#f9fafb',
+    paddingVertical: 6,
+    paddingHorizontal: 0,
+    marginRight: 8,
+  },
+  emailInputArrowButton: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#4f46e5',
+  },
+  emailInputArrowButtonDisabled: {
+    backgroundColor: '#4b5563',
+    opacity: 0.8,
   },
   emailInputArrow: {
-    fontSize: 18,
-    color: '#9ca3af',
+    fontSize: 16,
+    color: '#fff',
+    fontWeight: '700',
+  },
+  inlineFieldError: {
+    marginTop: 8,
+    marginBottom: 12,
+    alignSelf: 'stretch',
+    color: '#fca5a5',
+    fontSize: 12,
   },
   dividerRow: {
     flexDirection: 'row',
@@ -1653,27 +1876,105 @@ const styles = StyleSheet.create({
     fontWeight: '700',
   },
   homeTitle: {
-    fontSize: 24,
+    fontSize: 26,
     fontWeight: '700',
-    marginBottom: 4,
-    color: '#f9fafb',
+    marginBottom: 6,
+    color: '#f0f6fc',
     textAlign: 'center',
+    letterSpacing: -0.3,
   },
   connectedSubtitle: {
-    color: '#9ca3af',
-    fontSize: 14,
-    marginBottom: 18,
+    color: '#8b949e',
+    fontSize: 15,
+    marginBottom: 14,
     textAlign: 'center',
+  },
+  connectedHero: {
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  connectedAvatar: {
+    width: 72,
+    height: 72,
+    borderRadius: 36,
+    backgroundColor: 'rgba(99, 102, 241, 0.18)',
+    borderWidth: 1,
+    borderColor: 'rgba(129, 140, 248, 0.35)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 16,
+  },
+  connectedSectionTitle: {
+    alignSelf: 'flex-start',
+    fontSize: 13,
+    fontWeight: '700',
+    color: '#8b949e',
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginTop: 20,
+    marginBottom: 10,
+  },
+  connectedSectionHint: {
+    alignSelf: 'flex-start',
+    fontSize: 13,
+    color: '#6e7681',
+    marginTop: -4,
+    marginBottom: 10,
+    lineHeight: 18,
   },
   connectedCard: {
     width: '100%',
-    backgroundColor: '#202634',
+    backgroundColor: '#161b22',
     borderWidth: 1,
-    borderColor: '#374151',
+    borderColor: '#30363d',
     borderRadius: 16,
-    paddingVertical: 18,
-    paddingHorizontal: 16,
-    marginBottom: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 14,
+    marginBottom: 0,
+  },
+  walletRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    minHeight: 52,
+  },
+  walletRowIconWrap: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    backgroundColor: 'rgba(98, 126, 234, 0.12)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  walletRowIconSolana: {
+    backgroundColor: 'rgba(232, 121, 249, 0.12)',
+  },
+  walletRowBody: {
+    flex: 1,
+    minWidth: 0,
+  },
+  walletRowLabel: {
+    color: '#8b949e',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 4,
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+  },
+  walletRowMono: {
+    color: '#f0f6fc',
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  walletRowCopy: {
+    padding: 8,
+    marginLeft: 4,
+  },
+  walletRowDivider: {
+    height: 1,
+    backgroundColor: '#21262d',
+    marginVertical: 6,
+    marginLeft: 52,
   },
   walletInfoBlock: {
     backgroundColor: '#374151',
@@ -1698,52 +1999,78 @@ const styles = StyleSheet.create({
     textAlign: 'left',
   },
   providerPill: {
-    marginTop: 14,
+    marginTop: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
     alignSelf: 'center',
-    backgroundColor: 'rgba(34, 197, 94, 0.15)',
-    borderColor: 'rgba(34, 197, 94, 0.5)',
+    backgroundColor: 'rgba(34, 197, 94, 0.12)',
+    borderColor: 'rgba(52, 211, 153, 0.35)',
     borderWidth: 1,
     borderRadius: 999,
-    paddingVertical: 6,
-    paddingHorizontal: 12,
+    paddingVertical: 7,
+    paddingHorizontal: 14,
   },
   providerPillText: {
     color: '#86efac',
-    fontSize: 12,
+    fontSize: 13,
     fontWeight: '600',
   },
   connectedPrimaryButton: {
-    backgroundColor: '#374151',
+    backgroundColor: '#6366f1',
     alignSelf: 'stretch',
-    marginTop: 12,
-    borderRadius: 12,
-    minHeight: 48,
+    marginTop: 14,
+    borderRadius: 14,
+    minHeight: 52,
+    shadowColor: '#6366f1',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.25,
+    shadowRadius: 8,
+    elevation: 4,
   },
   connectedPrimaryButtonText: {
-    color: '#f9fafb',
+    color: '#f8fafc',
+    fontWeight: '700',
+    fontSize: 16,
+  },
+  connectedSecondaryButton: {
+    backgroundColor: 'transparent',
+    alignSelf: 'stretch',
+    marginTop: 0,
+    borderRadius: 14,
+    minHeight: 48,
+    borderWidth: 1.5,
+    borderColor: 'rgba(129, 140, 248, 0.55)',
+  },
+  connectedSecondaryButtonText: {
+    color: '#a5b4fc',
     fontWeight: '600',
+    fontSize: 15,
   },
   amountInputWrap: {
     width: '100%',
-    marginTop: 12,
-    marginBottom: 2,
+    marginTop: 16,
+    marginBottom: 4,
   },
   amountInputLabel: {
-    color: '#d1d5db',
-    fontSize: 13,
+    color: '#8b949e',
+    fontSize: 12,
     fontWeight: '600',
-    marginBottom: 6,
+    marginBottom: 8,
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
   },
   amountInput: {
     alignSelf: 'stretch',
-    minHeight: 46,
+    minHeight: 48,
     borderRadius: 12,
     borderWidth: 1,
-    borderColor: '#4b5563',
-    backgroundColor: '#374151',
-    color: '#f9fafb',
-    paddingHorizontal: 12,
-    fontSize: 15,
+    borderColor: '#30363d',
+    backgroundColor: '#0d1117',
+    color: '#f0f6fc',
+    paddingHorizontal: 14,
+    fontSize: 17,
+    fontWeight: '500',
   },
   amountInputError: {
     marginTop: 6,
@@ -1761,20 +2088,26 @@ const styles = StyleSheet.create({
     color: '#9ca3af',
   },
   logoutButton: {
-    backgroundColor: 'rgba(239, 68, 68, 0.12)',
-    marginTop: 24,
+    flexDirection: 'row',
+    backgroundColor: 'transparent',
+    marginTop: 28,
+    marginBottom: 28,
     paddingVertical: 14,
-    paddingHorizontal: 24,
-    borderRadius: 12,
+    paddingHorizontal: 20,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: '#ef4444',
+    borderColor: '#30363d',
     alignSelf: 'stretch',
     alignItems: 'center',
     justifyContent: 'center',
+    gap: 10,
     minHeight: 48,
   },
+  logoutIcon: {
+    marginRight: 0,
+  },
   logoutButtonText: {
-    color: '#ef4444',
+    color: '#f87171',
     fontSize: 16,
     fontWeight: '600',
   },
@@ -1782,9 +2115,9 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     width: '100%',
     alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 32,
-    paddingVertical: 24,
+    paddingHorizontal: 20,
+    paddingTop: 8,
+    paddingBottom: 32,
   },
   errorText: {
     color: '#ef4444',
@@ -1793,97 +2126,171 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     alignSelf: 'stretch',
   },
-  mfaStatusWrap: {
-    marginTop: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    backgroundColor: '#374151',
+  mfaHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  mfaHeaderTitle: {
+    flex: 1,
+    color: '#f0f6fc',
+    fontSize: 16,
+    fontWeight: '600',
+    marginRight: 12,
+  },
+  mfaBadgeLoading: {
+    paddingHorizontal: 8,
+  },
+  mfaStatusBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingVertical: 5,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    borderWidth: 1,
+  },
+  mfaStatusBadgeOn: {
+    backgroundColor: 'rgba(34, 197, 94, 0.12)',
+    borderColor: 'rgba(52, 211, 153, 0.35)',
+  },
+  mfaStatusBadgeOff: {
+    backgroundColor: 'rgba(110, 118, 129, 0.15)',
+    borderColor: '#30363d',
+  },
+  mfaStatusDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+  },
+  mfaStatusDotOn: {
+    backgroundColor: '#4ade80',
+  },
+  mfaStatusDotOff: {
+    backgroundColor: '#6e7681',
+  },
+  mfaStatusBadgeText: {
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  mfaStatusBadgeTextOn: {
+    color: '#86efac',
+  },
+  mfaStatusBadgeTextOff: {
+    color: '#8b949e',
+  },
+  mfaHint: {
+    color: '#6e7681',
+    fontSize: 13,
+    lineHeight: 19,
+    marginBottom: 16,
   },
   mfaActionRow: {
-    marginTop: 12,
     flexDirection: 'row',
     gap: 10,
   },
-  mfaActionButton: {
+  mfaPrimaryButton: {
     flex: 1,
-    minHeight: 40,
-    borderRadius: 10,
-    backgroundColor: '#111827',
-    borderWidth: 1,
-    borderColor: '#4b5563',
+    minHeight: 44,
+    borderRadius: 12,
+    backgroundColor: '#fbbf24',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 10,
   },
-  mfaActionButtonText: {
-    color: '#f9fafb',
-    fontSize: 13,
+  mfaPrimaryButtonDisabled: {
+    opacity: 0.45,
+  },
+  mfaPrimaryButtonText: {
+    color: '#0f172a',
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  mfaGhostButton: {
+    flex: 1,
+    minHeight: 44,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#484f58',
+    backgroundColor: 'transparent',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: 10,
+  },
+  mfaGhostButtonDisabled: {
+    opacity: 0.4,
+  },
+  mfaGhostButtonText: {
+    color: '#f0f6fc',
+    fontSize: 14,
     fontWeight: '600',
   },
   modalOverlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'rgba(2, 6, 23, 0.72)',
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 20,
+    paddingHorizontal: 16,
   },
   modalCard: {
     width: '100%',
-    maxWidth: 420,
-    borderRadius: 14,
-    padding: 18,
-    backgroundColor: '#1f2937',
+    maxWidth: 430,
+    borderRadius: 18,
+    padding: 20,
+    backgroundColor: '#1e293b',
     borderWidth: 1,
-    borderColor: '#374151',
+    borderColor: '#334155',
   },
   modalTitle: {
-    color: '#f9fafb',
-    fontSize: 20,
+    color: '#f8fafc',
+    fontSize: 24,
     fontWeight: '700',
+    letterSpacing: -0.2,
   },
   modalSubtitle: {
     marginTop: 6,
-    color: '#d1d5db',
+    color: '#94a3b8',
     fontSize: 13,
-    lineHeight: 18,
+    lineHeight: 19,
   },
   modalInput: {
     marginTop: 14,
     borderWidth: 1,
-    borderColor: '#4b5563',
-    borderRadius: 10,
-    minHeight: 44,
-    color: '#fff',
+    borderColor: '#475569',
+    borderRadius: 12,
+    minHeight: 48,
+    color: '#f8fafc',
     paddingHorizontal: 12,
+    backgroundColor: '#0f172a',
   },
   modalPrimaryButton: {
-    marginTop: 12,
-    minHeight: 44,
-    borderRadius: 10,
-    backgroundColor: '#374151',
+    marginTop: 14,
+    minHeight: 48,
+    borderRadius: 12,
+    backgroundColor: '#6366f1',
     alignItems: 'center',
     justifyContent: 'center',
   },
   modalPrimaryButtonText: {
     color: '#fff',
-    fontSize: 15,
-    fontWeight: '600',
+    fontSize: 16,
+    fontWeight: '700',
   },
   modalSecondaryButton: {
-    marginTop: 10,
-    minHeight: 40,
+    marginTop: 12,
+    minHeight: 42,
     alignItems: 'center',
     justifyContent: 'center',
   },
   modalSecondaryButtonText: {
-    color: '#cbd5e1',
+    color: '#e2e8f0',
     fontSize: 14,
     fontWeight: '600',
   },
   modalHint: {
-    marginTop: 10,
-    color: '#9ca3af',
+    marginTop: 12,
+    color: '#94a3b8',
     fontSize: 12,
     lineHeight: 18,
   },

@@ -1,7 +1,7 @@
 /**
  * Custom email + OTP modal (no SDK OnboardingUI).
  */
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Modal,
   View,
@@ -12,12 +12,19 @@ import {
   ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
+  Pressable,
 } from 'react-native';
 import { isValidEmail } from '@abstraxn/signer-core-react-native';
 import { useAbstraxnWallet } from '@abstraxn/signer-react-native';
 import { normalizeError } from './utils/errorMessages';
 
-export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
+export function EmailOtpModal({
+  visible,
+  onClose,
+  onMfaRequired,
+  prefilledEmail = '',
+  autoSendEmailOnOpen = false,
+}) {
   const { loginWithOTP, verifyOTP } = useAbstraxnWallet();
   const [step, setStep] = useState('email');
   const [email, setEmail] = useState('');
@@ -26,20 +33,56 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [resendCooldown, setResendCooldown] = useState(0);
+  const resendIntervalRef = useRef(null);
+
+  const clearResendInterval = useCallback(() => {
+    if (resendIntervalRef.current) {
+      clearInterval(resendIntervalRef.current);
+      resendIntervalRef.current = null;
+    }
+  }, []);
+
+  const startResendCooldown = useCallback(() => {
+    clearResendInterval();
+    setResendCooldown(60);
+    resendIntervalRef.current = setInterval(() => {
+      setResendCooldown((prev) => {
+        if (prev <= 1) {
+          clearResendInterval();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  }, [clearResendInterval]);
+
+  const maskedEmail = useMemo(() => {
+    const trimmed = String(email || '').trim();
+    if (!trimmed.includes('@')) return trimmed;
+    const [local, domain] = trimmed.split('@');
+    if (!local || !domain) return trimmed;
+    if (local.length <= 2) return `${local[0] || ''}***@${domain}`;
+    return `${local.slice(0, 2)}***@${domain}`;
+  }, [email]);
 
   useEffect(() => {
     if (visible) {
       setStep('email');
-      setEmail('');
+      setEmail(prefilledEmail || '');
       setOtp('');
       setOtpId(null);
       setError(null);
       setLoading(false);
       setResendCooldown(0);
+      clearResendInterval();
     }
-  }, [visible]);
+    return () => {
+      clearResendInterval();
+    };
+  }, [visible, prefilledEmail, clearResendInterval]);
 
   const resetAndClose = useCallback(() => {
+    clearResendInterval();
     setStep('email');
     setEmail('');
     setOtp('');
@@ -47,7 +90,7 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
     setError(null);
     setResendCooldown(0);
     onClose();
-  }, [onClose]);
+  }, [onClose, clearResendInterval]);
 
   const handleEmailSubmit = useCallback(async () => {
     if (!email || !isValidEmail(email)) {
@@ -60,16 +103,7 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
       const result = await loginWithOTP(email);
       setOtpId(result.otpId);
       setStep('otp');
-      setResendCooldown(60);
-      const interval = setInterval(() => {
-        setResendCooldown((prev) => {
-          if (prev <= 1) {
-            clearInterval(interval);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
+      startResendCooldown();
     } catch (err) {
       setError(
         normalizeError(err, {
@@ -80,7 +114,7 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
     } finally {
       setLoading(false);
     }
-  }, [email, loginWithOTP]);
+  }, [email, loginWithOTP, startResendCooldown]);
 
   const handleOtpSubmit = useCallback(async () => {
     if (!otp || otp.length !== 6) {
@@ -121,16 +155,7 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
     try {
       const result = await loginWithOTP(email);
       setOtpId(result.otpId);
-      setResendCooldown(60);
-      const interval = setInterval(() => {
-        setResendCooldown((prev) => {
-          if (prev <= 1) {
-            clearInterval(interval);
-            return 0;
-          }
-          return prev - 1;
-        });
-      }, 1000);
+      startResendCooldown();
     } catch (err) {
       setError(
         normalizeError(err, {
@@ -141,18 +166,61 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
     } finally {
       setLoading(false);
     }
-  }, [email, loginWithOTP, resendCooldown, loading]);
+  }, [email, loginWithOTP, resendCooldown, loading, startResendCooldown]);
+
+  useEffect(() => {
+    if (!visible || !autoSendEmailOnOpen) return;
+    if (!isValidEmail(email) || loading || step !== 'email') return;
+    handleEmailSubmit();
+  }, [visible, autoSendEmailOnOpen, email, loading, step, handleEmailSubmit]);
 
   if (!visible) return null;
 
   return (
-    <Modal visible transparent animationType="fade" onRequestClose={resetAndClose}>
+    <Modal
+      visible
+      transparent
+      animationType="fade"
+      onRequestClose={resetAndClose}
+    >
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
         style={styles.overlay}
       >
+        <Pressable
+          style={StyleSheet.absoluteFill}
+          onPress={() => {
+            if (!loading) resetAndClose();
+          }}
+        />
         <View style={styles.card}>
-          <Text style={styles.title}>Sign In</Text>
+          <View style={styles.stepRow}>
+            <View style={[styles.stepPill, styles.stepPillActive]}>
+              <Text style={styles.stepPillTextActive}>1. Email</Text>
+            </View>
+            <View
+              style={[
+                styles.stepPill,
+                step === 'otp' ? styles.stepPillActive : styles.stepPillIdle,
+              ]}
+            >
+              <Text
+                style={[
+                  styles.stepPillTextIdle,
+                  step === 'otp' && styles.stepPillTextActive,
+                ]}
+              >
+                2. Verify
+              </Text>
+            </View>
+          </View>
+
+          <Text style={styles.title}>Sign in</Text>
+          <Text style={styles.subtitle}>
+            {step === 'email'
+              ? 'Use your email to receive a verification code.'
+              : `Enter the 6-digit code sent to ${maskedEmail || 'your inbox'}.`}
+          </Text>
           {error ? <Text style={styles.error}>{error}</Text> : null}
 
           {step === 'email' ? (
@@ -171,6 +239,10 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
                 autoCapitalize="none"
                 autoCorrect={false}
                 editable={!loading}
+                selectionColor="#818cf8"
+                autoFocus
+                returnKeyType="done"
+                onSubmitEditing={handleEmailSubmit}
               />
               <TouchableOpacity
                 style={[styles.button, (loading || !isValidEmail(email)) && styles.buttonDisabled]}
@@ -199,6 +271,11 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
                 keyboardType="number-pad"
                 maxLength={6}
                 editable={!loading}
+                selectionColor="#818cf8"
+                autoFocus
+                textContentType="oneTimeCode"
+                returnKeyType="done"
+                onSubmitEditing={handleOtpSubmit}
               />
               <TouchableOpacity
                 style={[styles.button, (loading || otp.length !== 6) && styles.buttonDisabled]}
@@ -235,50 +312,89 @@ export function EmailOtpModal({ visible, onClose, onMfaRequired }) {
 const styles = StyleSheet.create({
   overlay: {
     flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    backgroundColor: 'rgba(3, 7, 18, 0.72)',
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 24,
+    paddingHorizontal: 16,
   },
   card: {
-    backgroundColor: '#1f2937',
-    borderRadius: 16,
-    padding: 24,
+    backgroundColor: '#1e293b',
+    borderRadius: 18,
+    padding: 20,
     width: '100%',
-    maxWidth: 400,
+    maxWidth: 430,
+    borderWidth: 1,
+    borderColor: '#334155',
+  },
+  stepRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 14,
+  },
+  stepPill: {
+    borderRadius: 999,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+  },
+  stepPillActive: {
+    backgroundColor: 'rgba(99, 102, 241, 0.18)',
+    borderColor: 'rgba(129, 140, 248, 0.5)',
+  },
+  stepPillIdle: {
+    backgroundColor: 'rgba(15, 23, 42, 0.7)',
+    borderColor: '#334155',
+  },
+  stepPillTextActive: {
+    color: '#c7d2fe',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  stepPillTextIdle: {
+    color: '#94a3b8',
+    fontSize: 12,
+    fontWeight: '600',
   },
   title: {
-    fontSize: 22,
+    fontSize: 28,
     fontWeight: '700',
-    marginBottom: 24,
-    color: '#f9fafb',
+    color: '#f8fafc',
+    letterSpacing: -0.2,
+  },
+  subtitle: {
+    marginTop: 6,
+    marginBottom: 18,
+    color: '#94a3b8',
+    fontSize: 13,
+    lineHeight: 18,
   },
   label: {
     fontSize: 14,
-    fontWeight: '500',
+    fontWeight: '600',
     marginBottom: 8,
-    color: '#d1d5db',
+    color: '#cbd5e1',
   },
   input: {
     borderWidth: 1,
-    borderColor: '#4b5563',
+    borderColor: '#475569',
     borderRadius: 12,
-    padding: 14,
+    paddingVertical: 13,
+    paddingHorizontal: 14,
     fontSize: 16,
     marginBottom: 16,
-    color: '#f9fafb',
+    color: '#f8fafc',
+    backgroundColor: '#0f172a',
   },
   button: {
-    backgroundColor: '#1f2937',
+    backgroundColor: '#6366f1',
     borderRadius: 12,
-    padding: 14,
+    paddingVertical: 14,
+    minHeight: 48,
     alignItems: 'center',
     marginTop: 8,
-    borderWidth: 1,
-    borderColor: '#374151',
   },
   buttonDisabled: {
-    opacity: 0.6,
+    opacity: 0.5,
   },
   buttonText: {
     color: '#fff',
@@ -286,25 +402,38 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
   error: {
-    color: '#dc2626',
-    fontSize: 14,
-    marginBottom: 12,
+    color: '#fca5a5',
+    fontSize: 13,
+    lineHeight: 18,
+    marginBottom: 10,
+    backgroundColor: 'rgba(239, 68, 68, 0.14)',
+    borderWidth: 1,
+    borderColor: 'rgba(239, 68, 68, 0.35)',
+    borderRadius: 10,
+    paddingVertical: 8,
+    paddingHorizontal: 10,
   },
   closeRow: {
-    marginTop: 16,
+    marginTop: 14,
     alignItems: 'center',
+    minHeight: 40,
+    justifyContent: 'center',
   },
   closeText: {
-    color: '#fff',
+    color: '#cbd5e1',
     fontSize: 14,
+    fontWeight: '600',
   },
   resend: {
     marginTop: 12,
     alignItems: 'center',
+    minHeight: 36,
+    justifyContent: 'center',
   },
   resendText: {
-    color: '#fff',
-    fontSize: 14,
+    color: '#a5b4fc',
+    fontSize: 13,
+    fontWeight: '600',
   },
   resendDisabled: {
     opacity: 0.5,
