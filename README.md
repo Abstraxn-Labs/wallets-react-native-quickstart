@@ -132,6 +132,7 @@ If this checkout uses a **local** `file:` dependency in `package.json`, adjust i
 1. **API key** — Set your Abstraxn API key in the app config (this demo uses constants near the top of `App.js`). Replace any placeholder with your own key.
 2. **Passkeys** — Set **`rpId`** to the Relying Party ID that matches your Abstraxn / passkey setup (see `SDK_FRONTEND_GUIDE.md`).
 3. **OAuth redirects** — Align your **redirect URL scheme** with your app’s deep linking and your Abstraxn dashboard settings (this demo uses a custom scheme constant in `App.js`).
+4. **Android release signing** — Copy `android/keystore.properties.example` to `android/keystore.properties`, set your keystore credentials, and keep it out of git.
 
 Do **not** commit production secrets to a public repository. Treat API keys like passwords.
 
@@ -163,6 +164,7 @@ This section summarizes what was checked for a **public** demo repo.
 | Run Android | `npm run android` |
 | Lint | `npm run lint` |
 | Tests | `npm test` |
+| Build release APK | `npm run android:apk` |
 
 ---
 

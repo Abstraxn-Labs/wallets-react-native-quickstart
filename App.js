@@ -9,6 +9,7 @@ import {
   Linking,
   ActivityIndicator,
   Alert,
+  AppState,
   useWindowDimensions,
   ScrollView,
   Platform,
@@ -32,6 +33,7 @@ import { DemoSignTransactionButton } from './components/DemoSignTransactionButto
 import { DemoSignAndSendTransactionButton } from './components/DemoSignAndSendTransactionButton';
 import { normalizeError } from './src/utils/errorMessages';
 import { parseEther } from 'viem';
+import QRCode from 'react-native-qrcode-svg';
 
 // Redirect scheme for OAuth: backend redirects to myabstraxnapp://success=true&user=...
 const OAUTH_REDIRECT_SCHEME = 'myabstraxnapp://';
@@ -42,6 +44,14 @@ const APP_API_KEY = ABSTRAXN_API_KEY || 'YOUR_ABSTRAXN_API_KEY';
 const GOOGLE_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/google/callback';
 const DISCORD_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/discord/callback';
 const TWITTER_CALLBACK_URL_PATH = 'signer.abstraxn.com/login/x/callback';
+const console = __DEV__
+  ? global.console
+  : {
+      log: () => {},
+      warn: () => {},
+      error: () => {},
+    };
+const ERROR_BANNER_TIMEOUT_MS = 6000;
 
 function buildOAuthFallbackUrl(providerPath) {
   const base = `${API_BASE_URL}${providerPath}`;
@@ -84,12 +94,17 @@ function getSearchParams(url) {
       const hashQuery = parsed.hash.replace(/^#\/?/, '');
       return hashQuery ? new URLSearchParams(hashQuery) : null;
     }
+    // Custom scheme oddities: myabstraxnapp:///path?x=1 or host-style k=v&k2=v2
+    const path = parsed.pathname?.replace(/^\//, '') ?? '';
+    if (path && path.includes('=') && !parsed.search) {
+      return new URLSearchParams(path);
+    }
     return null;
   } catch {
     const qs = url.includes('?')
       ? url.split('?')[1]
       : url.replace(/^[^?]*\/\/?/, '');
-    if (qs) return new URLSearchParams(qs);
+    if (qs) return new URLSearchParams(qs.split('#')[0]);
     const hashIdx = url.indexOf('#');
     if (hashIdx >= 0) {
       const hashQuery = url.slice(hashIdx + 1).replace(/^\/?/, '');
@@ -97,6 +112,22 @@ function getSearchParams(url) {
     }
     return null;
   }
+}
+
+/** Case-insensitive query lookup (some devices / intermediaries vary casing). */
+function getParamCI(params, key) {
+  if (!params || !key) return null;
+  const want = String(key).toLowerCase();
+  for (const [k, v] of params.entries()) {
+    if (String(k).toLowerCase() === want) return v;
+  }
+  return null;
+}
+
+function isTruthyParam(raw) {
+  if (raw == null) return false;
+  const s = String(raw).trim().toLowerCase();
+  return s === 'true' || s === '1' || s === 'yes';
 }
 
 function isOAuthRedirectUrl(url) {
@@ -120,6 +151,8 @@ function WalletSection() {
   const { verifySetupMfaWithSignRetry } = useEnableMfa();
   const { disableMfaWithSignRetry } = useDisableMfa();
   const {
+    wallet,
+    isInitialized,
     isConnected,
     address,
     whoami,
@@ -128,6 +161,7 @@ function WalletSection() {
     connect,
     refreshWhoami,
     verifyMfa,
+    getLastAuthState,
     getMfaStatus,
     enableMfa,
     verifySetupMfa,
@@ -151,7 +185,8 @@ function WalletSection() {
   const [passkeyCreateLoading, setPasskeyCreateLoading] = React.useState(false);
   const [passkeyImportLoading, setPasskeyImportLoading] = React.useState(false);
   const [passkeyError, setPasskeyError] = React.useState(null);
-  const [emailOnboardingVisible, setEmailOnboardingVisible] = React.useState(false);
+  const [emailOnboardingVisible, setEmailOnboardingVisible] =
+    React.useState(false);
   const [emailLoginValue, setEmailLoginValue] = React.useState('');
   const [emailLoginError, setEmailLoginError] = React.useState(null);
   const [mfaPromptVisible, setMfaPromptVisible] = React.useState(false);
@@ -166,15 +201,22 @@ function WalletSection() {
   const [mfaSetupCode, setMfaSetupCode] = React.useState('');
   const [mfaSetupLoading, setMfaSetupLoading] = React.useState(false);
   const [mfaSetupPayload, setMfaSetupPayload] = React.useState(null);
-  const [mfaBackupCodesVisible, setMfaBackupCodesVisible] = React.useState(false);
+  const [mfaBackupCodesVisible, setMfaBackupCodesVisible] =
+    React.useState(false);
   const [mfaBackupCodes, setMfaBackupCodes] = React.useState([]);
   const [mfaDisableVisible, setMfaDisableVisible] = React.useState(false);
   const [mfaDisableCode, setMfaDisableCode] = React.useState('');
   const [mfaDisableLoading, setMfaDisableLoading] = React.useState(false);
+  const [addressQrVisible, setAddressQrVisible] = React.useState(false);
+  const [addressQrValue, setAddressQrValue] = React.useState('');
+  const [addressQrLabel, setAddressQrLabel] = React.useState('');
   const [sendAmount, setSendAmount] = React.useState('0.001');
   // Dedupe: Google/Discord auth codes are single-use; prevent processing same code twice (avoids invalid_grant)
   const processedCallbackRef = React.useRef(null);
   const activeOAuthProviderRef = React.useRef('google');
+  /** OAuth URLs received before wallet init (release devices often hit this race). */
+  const pendingOAuthUrlsRef = React.useRef([]);
+  const flushOAuthPendingRef = React.useRef(() => {});
 
   const { width: screenWidth } = useWindowDimensions();
   const cardMaxWidth = Math.min(400, screenWidth - 32);
@@ -213,7 +255,9 @@ function WalletSection() {
   const handleMfaVerify = React.useCallback(async () => {
     const normalized = mfaCode.trim().toUpperCase();
     if (!/^\d{6}$/.test(normalized) && !/^[A-Z0-9]{8}$/.test(normalized)) {
-      setMfaError('Please enter a valid 6-digit code or 8-character backup code.');
+      setMfaError(
+        'Please enter a valid 6-digit code or 8-character backup code.',
+      );
       return;
     }
     setMfaLoading(true);
@@ -242,6 +286,18 @@ function WalletSection() {
       const status = await getMfaStatus();
       setMfaStatus(status);
     } catch (e) {
+      const message = String(e?.message ?? e ?? '').toLowerCase();
+      const authNotReady =
+        message.includes('no refresh token available') ||
+        message.includes('no access token available') ||
+        message.includes('user not authenticated') ||
+        message.includes('wallet not connected');
+      if (authNotReady) {
+        // Avoid noisy UI errors during startup/logout races.
+        setMfaStatus(null);
+        setMfaManageError(null);
+        return;
+      }
       setMfaManageError(
         normalizeError(e, {
           fallback: 'Failed to fetch MFA status.',
@@ -262,9 +318,9 @@ function WalletSection() {
     }
   };
 
-  React.useEffect(() => {
-    const handleUrl = ({ url }) => {
-      console.log('[OAuth] handleUrl received:', url ?? '(empty)');
+  const processOAuthUrl = React.useCallback(
+    url => {
+      console.log('[OAuth] processOAuthUrl:', url ?? '(empty)');
       if (!url || !isOAuthRedirectUrl(url)) {
         if (url) console.log('[OAuth] Skipped: not an OAuth redirect URL');
         return;
@@ -289,16 +345,23 @@ function WalletSection() {
         console.log(`[OAuth]   ${key}=`, preview);
       });
 
-      // Backend redirect: myabstraxnapp://success=true&user=... (or with ?query)
-      const success = params.get('success');
-      const errorParam = params.get('error');
-      const mfaRequiredFromUrl = params.get('mfaRequired') === 'true';
+      const success = getParamCI(params, 'success');
+      const errorParam = getParamCI(params, 'error');
+      const mfaRequiredFromUrl = isTruthyParam(
+        getParamCI(params, 'mfaRequired'),
+      );
+      const isPolicyFromUrl = isTruthyParam(getParamCI(params, 'isPolicy'));
       const provider = detectOAuthProvider(
         url,
         params,
         activeOAuthProviderRef.current,
       );
-      console.log('[OAuth] Detected provider:', provider);
+      console.log(
+        '[OAuth] Detected provider:',
+        provider,
+        'mfaRequired(url)=',
+        mfaRequiredFromUrl,
+      );
       if (errorParam != null && errorParam !== '') {
         const decodedError = decodeURIComponent(errorParam);
         console.error('[OAuth] Error from backend:', decodedError);
@@ -310,13 +373,17 @@ function WalletSection() {
         );
         return;
       }
-      if (success === 'true') {
+      if (success != null && String(success).toLowerCase() === 'true') {
         const accessToken =
-          params.get('accessToken') ?? params.get('access_token');
+          getParamCI(params, 'accessToken') ??
+          getParamCI(params, 'access_token');
         const refreshToken =
-          params.get('refreshToken') ?? params.get('refresh_token');
-        const userParam = params.get('user') ?? params.get('userData');
-        const turnkeyPublicKey = params.get('turnkeyPublicKey') ?? undefined;
+          getParamCI(params, 'refreshToken') ??
+          getParamCI(params, 'refresh_token');
+        const userParam =
+          getParamCI(params, 'user') ?? getParamCI(params, 'userData');
+        const turnkeyPublicKey =
+          getParamCI(params, 'turnkeyPublicKey') ?? undefined;
         console.log(
           '[OAuth] Success branch: accessToken=',
           !!accessToken,
@@ -356,10 +423,14 @@ function WalletSection() {
             refreshToken,
             user: userObj,
             turnkeyPublicKey,
+            mfaRequired: mfaRequiredFromUrl,
+            isPolicy: isPolicyFromUrl,
           })
             .then(async () => {
               console.log('[OAuth] completeOAuthFromDeepLink done');
-              if (mfaRequiredFromUrl) {
+              const pendingMfa =
+                mfaRequiredFromUrl || getLastAuthState()?.mfaRequired === true;
+              if (pendingMfa) {
                 openMfaPrompt(`oauth:${provider}`);
                 return;
               }
@@ -394,7 +465,9 @@ function WalletSection() {
         completeOAuthReturnFromUrl(url, provider)
           .then(async user => {
             console.log('[OAuth] completeOAuthReturnFromUrl done:', !!user);
-            if (mfaRequiredFromUrl) {
+            const pendingMfa =
+              mfaRequiredFromUrl || getLastAuthState()?.mfaRequired === true;
+            if (pendingMfa) {
               openMfaPrompt(`oauth:${provider}`);
               return;
             }
@@ -425,8 +498,8 @@ function WalletSection() {
       }
 
       // Fallback: backend redirected with code & state (app exchanges via API). Code is single-use.
-      const code = params.get('code');
-      const state = params.get('state');
+      const code = getParamCI(params, 'code');
+      const state = getParamCI(params, 'state');
       if (!code || !state) {
         console.log(
           '[OAuth] No success, no error, no code/state — redirect may be missing expected params',
@@ -504,7 +577,9 @@ function WalletSection() {
             : handleGoogleCallback(code, state);
         callbackPromise
           .then(async () => {
-            if (mfaRequiredFromUrl) {
+            const pendingMfa =
+              mfaRequiredFromUrl || getLastAuthState()?.mfaRequired === true;
+            if (pendingMfa) {
               openMfaPrompt(`oauth:${provider}`);
               return;
             }
@@ -528,33 +603,68 @@ function WalletSection() {
           })
           .finally(() => setProviderLoading(provider, false));
       }
-    };
+    },
+    [
+      handleGoogleCallback,
+      handleDiscordCallback,
+      handleTwitterCallback,
+      completeOAuthFromDeepLink,
+      completeOAuthReturnFromUrl,
+      finalizeAuthSession,
+      getLastAuthState,
+      openMfaPrompt,
+    ],
+  );
 
-    const subscription = Linking.addEventListener('url', handleUrl);
+  React.useEffect(() => {
+    flushOAuthPendingRef.current = () => {
+      if (!isInitialized || !wallet) {
+        return;
+      }
+      const q = pendingOAuthUrlsRef.current;
+      while (q.length > 0) {
+        const next = q.shift();
+        processOAuthUrl(next);
+      }
+    };
+  }, [isInitialized, wallet, processOAuthUrl]);
+
+  React.useEffect(() => {
+    const sub = Linking.addEventListener('url', ({ url }) => {
+      pendingOAuthUrlsRef.current.push(url);
+      flushOAuthPendingRef.current();
+    });
     Linking.getInitialURL().then(initialUrl => {
       if (initialUrl) {
         console.log('[OAuth] getInitialURL:', initialUrl);
-        handleUrl({ url: initialUrl });
+        pendingOAuthUrlsRef.current.push(initialUrl);
+        flushOAuthPendingRef.current();
       }
     });
-    return () => subscription.remove();
-  }, [
-    handleGoogleCallback,
-    handleDiscordCallback,
-    handleTwitterCallback,
-    completeOAuthFromDeepLink,
-    completeOAuthReturnFromUrl,
-    finalizeAuthSession,
-    openMfaPrompt,
-  ]);
+    return () => sub.remove();
+  }, []);
 
   React.useEffect(() => {
-    if (isConnected) {
+    flushOAuthPendingRef.current();
+  }, [isInitialized, wallet, processOAuthUrl]);
+
+  React.useEffect(() => {
+    const sub = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        flushOAuthPendingRef.current();
+      }
+    });
+    return () => sub.remove();
+  }, []);
+
+  React.useEffect(() => {
+    if (isConnected && whoami) {
       refreshMfaStatus();
     } else {
       setMfaStatus(null);
+      setMfaManageError(null);
     }
-  }, [isConnected, refreshMfaStatus]);
+  }, [isConnected, whoami, refreshMfaStatus]);
 
   const openAuthUrl = async (url, options = {}) => {
     if (await InAppBrowser.isAvailable()) {
@@ -828,7 +938,9 @@ function WalletSection() {
   const onMfaDisable = async () => {
     const normalized = mfaDisableCode.trim().toUpperCase();
     if (!/^\d{6}$/.test(normalized) && !/^[A-Z0-9]{8}$/.test(normalized)) {
-      setMfaManageError('Enter a valid 6-digit code or 8-character backup code.');
+      setMfaManageError(
+        'Enter a valid 6-digit code or 8-character backup code.',
+      );
       return;
     }
     setMfaDisableLoading(true);
@@ -883,6 +995,26 @@ function WalletSection() {
     setEmailOnboardingVisible(true);
   }, [isInlineEmailValid]);
 
+  React.useEffect(() => {
+    if (!(oauthError || passkeyError || mfaError || mfaManageError)) {
+      return;
+    }
+    const timeoutId = setTimeout(() => {
+      setOauthError(null);
+      setPasskeyError(null);
+      setMfaError(null);
+      setMfaManageError(null);
+    }, ERROR_BANNER_TIMEOUT_MS);
+    return () => clearTimeout(timeoutId);
+  }, [oauthError, passkeyError, mfaError, mfaManageError]);
+
+  const openAddressQr = React.useCallback((value, label) => {
+    if (!value) return;
+    setAddressQrValue(value);
+    setAddressQrLabel(label);
+    setAddressQrVisible(true);
+  }, []);
+
   if (isConnected) {
     const copyAddress = (value, label) => {
       if (!value) return;
@@ -921,21 +1053,44 @@ function WalletSection() {
               <View style={styles.walletRowIconWrap}>
                 <FontAwesome5 name="ethereum" size={18} color="#627eea" brand />
               </View>
-              <View style={styles.walletRowBody}>
-                <Text style={styles.walletRowLabel}>Ethereum</Text>
-                <Text style={styles.walletRowMono} selectable>
-                  {evmAddress ? formatAddressShort(evmAddress) : 'Not available'}
-                </Text>
-              </View>
               {evmAddress ? (
                 <TouchableOpacity
-                  style={styles.walletRowCopy}
-                  onPress={() => copyAddress(evmAddress, 'EVM address')}
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  accessibilityLabel="Copy EVM address"
+                  style={styles.walletRowBody}
+                  activeOpacity={0.75}
+                  onPress={() => openAddressQr(evmAddress, 'Ethereum address')}
                 >
-                  <FontAwesome5 name="copy" size={15} color="#8b949e" />
+                  <Text style={styles.walletRowLabel}>Ethereum</Text>
+                  <Text style={styles.walletRowMono} selectable>
+                    {formatAddressShort(evmAddress)}
+                  </Text>
                 </TouchableOpacity>
+              ) : (
+                <View style={styles.walletRowBody}>
+                  <Text style={styles.walletRowLabel}>Ethereum</Text>
+                  <Text style={styles.walletRowMono} selectable>
+                    Not available
+                  </Text>
+                </View>
+              )}
+              {evmAddress ? (
+                <View style={styles.walletRowActions}>
+                  <TouchableOpacity
+                    style={styles.walletRowCopy}
+                    onPress={() => openAddressQr(evmAddress, 'Ethereum address')}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel="Show EVM address QR"
+                  >
+                    <FontAwesome5 name="qrcode" size={16} color="#8b949e" />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.walletRowCopy}
+                    onPress={() => copyAddress(evmAddress, 'EVM address')}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel="Copy EVM address"
+                  >
+                    <FontAwesome5 name="copy" size={15} color="#8b949e" />
+                  </TouchableOpacity>
+                </View>
               ) : null}
             </View>
             <View style={styles.walletRowDivider} />
@@ -945,23 +1100,48 @@ function WalletSection() {
               >
                 <FontAwesome5 name="sun" size={17} color="#e879f9" />
               </View>
-              <View style={styles.walletRowBody}>
-                <Text style={styles.walletRowLabel}>Solana</Text>
-                <Text style={styles.walletRowMono} selectable>
-                  {solanaAddress
-                    ? formatAddressShort(solanaAddress, 6, 6)
-                    : 'Not available'}
-                </Text>
-              </View>
               {solanaAddress ? (
                 <TouchableOpacity
-                  style={styles.walletRowCopy}
-                  onPress={() => copyAddress(solanaAddress, 'Solana address')}
-                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
-                  accessibilityLabel="Copy Solana address"
+                  style={styles.walletRowBody}
+                  activeOpacity={0.75}
+                  onPress={() =>
+                    openAddressQr(solanaAddress, 'Solana address')
+                  }
                 >
-                  <FontAwesome5 name="copy" size={15} color="#8b949e" />
+                  <Text style={styles.walletRowLabel}>Solana</Text>
+                  <Text style={styles.walletRowMono} selectable>
+                    {formatAddressShort(solanaAddress, 6, 6)}
+                  </Text>
                 </TouchableOpacity>
+              ) : (
+                <View style={styles.walletRowBody}>
+                  <Text style={styles.walletRowLabel}>Solana</Text>
+                  <Text style={styles.walletRowMono} selectable>
+                    Not available
+                  </Text>
+                </View>
+              )}
+              {solanaAddress ? (
+                <View style={styles.walletRowActions}>
+                  <TouchableOpacity
+                    style={styles.walletRowCopy}
+                    onPress={() =>
+                      openAddressQr(solanaAddress, 'Solana address')
+                    }
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel="Show Solana address QR"
+                  >
+                    <FontAwesome5 name="qrcode" size={16} color="#8b949e" />
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={styles.walletRowCopy}
+                    onPress={() => copyAddress(solanaAddress, 'Solana address')}
+                    hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    accessibilityLabel="Copy Solana address"
+                  >
+                    <FontAwesome5 name="copy" size={15} color="#8b949e" />
+                  </TouchableOpacity>
+                </View>
               ) : null}
             </View>
           </View>
@@ -969,7 +1149,9 @@ function WalletSection() {
           <Text style={styles.connectedSectionTitle}>Security</Text>
           <View style={styles.connectedCard}>
             <View style={styles.mfaHeaderRow}>
-              <Text style={styles.mfaHeaderTitle}>Multi-factor authentication</Text>
+              <Text style={styles.mfaHeaderTitle}>
+                Multi-factor authentication
+              </Text>
               {mfaStatusLoading ? (
                 <View style={styles.mfaBadgeLoading}>
                   <ActivityIndicator size="small" color="#8b949e" />
@@ -1119,6 +1301,33 @@ function WalletSection() {
           </TouchableOpacity>
         </ScrollView>
         <Modal
+          visible={addressQrVisible}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setAddressQrVisible(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalCard}>
+              <Text style={styles.modalTitle}>{addressQrLabel}</Text>
+              <Text style={styles.modalSubtitle}>
+                Scan this QR in another wallet app to prefill recipient address.
+              </Text>
+              <View style={styles.addressQrWrap}>
+                <QRCode value={addressQrValue || ' '} size={220} />
+              </View>
+              <Text style={styles.modalHint} selectable>
+                {addressQrValue}
+              </Text>
+              <TouchableOpacity
+                style={styles.modalSecondaryButton}
+                onPress={() => setAddressQrVisible(false)}
+              >
+                <Text style={styles.modalSecondaryButtonText}>Close</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+        <Modal
           visible={mfaSetupVisible}
           transparent
           animationType="fade"
@@ -1127,7 +1336,9 @@ function WalletSection() {
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
               <Text style={styles.modalTitle}>Setup MFA</Text>
-              <Text style={styles.modalSubtitle}>Scan this QR in your authenticator app or use the secret.</Text>
+              <Text style={styles.modalSubtitle}>
+                Scan this QR in your authenticator app or use the secret.
+              </Text>
               {!!mfaSetupPayload?.qrCode && (
                 <Image
                   source={{ uri: mfaSetupPayload.qrCode }}
@@ -1136,26 +1347,36 @@ function WalletSection() {
                 />
               )}
               {!!mfaSetupPayload?.secret && (
-                <Text style={styles.modalHint} selectable>Secret: {mfaSetupPayload.secret}</Text>
+                <Text style={styles.modalHint} selectable>
+                  Secret: {mfaSetupPayload.secret}
+                </Text>
               )}
               <TextInput
                 style={styles.modalInput}
                 value={mfaSetupCode}
-                onChangeText={v => setMfaSetupCode(v.replace(/\D/g, '').slice(0, 6))}
+                onChangeText={v =>
+                  setMfaSetupCode(v.replace(/\D/g, '').slice(0, 6))
+                }
                 keyboardType="number-pad"
                 placeholder="Enter 6-digit setup code"
                 placeholderTextColor="#9ca3af"
                 editable={!mfaSetupLoading}
               />
               <TouchableOpacity
-                style={[styles.modalPrimaryButton, (mfaSetupCode.trim().length !== 6 || mfaSetupLoading) && styles.buttonDisabled]}
+                style={[
+                  styles.modalPrimaryButton,
+                  (mfaSetupCode.trim().length !== 6 || mfaSetupLoading) &&
+                    styles.buttonDisabled,
+                ]}
                 onPress={onMfaSetupVerify}
                 disabled={mfaSetupCode.trim().length !== 6 || mfaSetupLoading}
               >
                 {mfaSetupLoading ? (
                   <ActivityIndicator size="small" color="#fff" />
                 ) : (
-                  <Text style={styles.modalPrimaryButtonText}>Verify setup</Text>
+                  <Text style={styles.modalPrimaryButtonText}>
+                    Verify setup
+                  </Text>
                 )}
               </TouchableOpacity>
               <TouchableOpacity
@@ -1177,9 +1398,13 @@ function WalletSection() {
           <View style={styles.modalOverlay}>
             <View style={styles.modalCard}>
               <Text style={styles.modalTitle}>Backup Codes</Text>
-              <Text style={styles.modalSubtitle}>Save these codes. Each code can be used once.</Text>
+              <Text style={styles.modalSubtitle}>
+                Save these codes. Each code can be used once.
+              </Text>
               <Text style={styles.modalHint} selectable>
-                {mfaBackupCodes.length ? mfaBackupCodes.join('\n') : 'No backup codes returned.'}
+                {mfaBackupCodes.length
+                  ? mfaBackupCodes.join('\n')
+                  : 'No backup codes returned.'}
               </Text>
               <TouchableOpacity
                 style={styles.modalPrimaryButton}
@@ -1216,14 +1441,19 @@ function WalletSection() {
                 placeholderTextColor="#9ca3af"
               />
               <TouchableOpacity
-                style={[styles.modalPrimaryButton, mfaDisableLoading && styles.buttonDisabled]}
+                style={[
+                  styles.modalPrimaryButton,
+                  mfaDisableLoading && styles.buttonDisabled,
+                ]}
                 onPress={onMfaDisable}
                 disabled={mfaDisableLoading}
               >
                 {mfaDisableLoading ? (
                   <ActivityIndicator size="small" color="#fff" />
                 ) : (
-                  <Text style={styles.modalPrimaryButtonText}>Verify & Disable</Text>
+                  <Text style={styles.modalPrimaryButtonText}>
+                    Verify & Disable
+                  </Text>
                 )}
               </TouchableOpacity>
               <TouchableOpacity
@@ -1266,7 +1496,9 @@ function WalletSection() {
             Platform.OS === 'ios' && { paddingTop: 40 },
           ]}
         >
-          {oauthError ? <Text style={styles.errorText}>{oauthError}</Text> : null}
+          {oauthError ? (
+            <Text style={styles.errorText}>{oauthError}</Text>
+          ) : null}
           {passkeyError ? (
             <Text style={styles.errorText}>{passkeyError}</Text>
           ) : null}
@@ -1473,6 +1705,8 @@ function WalletSection() {
         visible={mfaPromptVisible}
         transparent
         animationType="fade"
+        statusBarTranslucent
+        presentationStyle="overFullScreen"
         onRequestClose={() => {
           if (!mfaLoading) {
             setMfaPromptVisible(false);
@@ -1970,6 +2204,11 @@ const styles = StyleSheet.create({
     padding: 8,
     marginLeft: 4,
   },
+  walletRowActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginLeft: 4,
+  },
   walletRowDivider: {
     height: 1,
     backgroundColor: '#21262d',
@@ -2293,6 +2532,13 @@ const styles = StyleSheet.create({
     color: '#94a3b8',
     fontSize: 12,
     lineHeight: 18,
+  },
+  addressQrWrap: {
+    marginTop: 14,
+    alignSelf: 'center',
+    borderRadius: 10,
+    padding: 10,
+    backgroundColor: '#fff',
   },
   mfaQrImage: {
     width: 220,

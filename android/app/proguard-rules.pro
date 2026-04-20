@@ -8,3 +8,11 @@
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
 # Add any project specific keep options here:
+
+# Keep React Native bridge classes used via reflection.
+-keep class com.facebook.react.bridge.** { *; }
+-keep class com.facebook.react.turbomodule.** { *; }
+-keep class com.facebook.hermes.** { *; }
+
+# Keep source and line info for actionable crash reports.
+-keepattributes SourceFile,LineNumberTable

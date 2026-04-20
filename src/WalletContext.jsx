@@ -118,6 +118,7 @@ export function WalletProvider({ config, children }) {
     config.storage,
     config.stamper,
     config.rpId,
+    config.passkeyConfig,
   ]);
 
   useEffect(() => {
@@ -128,7 +129,7 @@ export function WalletProvider({ config, children }) {
       walletRef.current = null;
       setWalletInstance(null);
     };
-  }, []);
+  }, [config.autoInit, init]);
 
   const connect = useCallback(async () => {
     const w = walletRef.current;

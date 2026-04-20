@@ -1,10 +1,50 @@
 const DEFAULT_MESSAGE = 'Something went wrong. Please try again.';
 
+function readPathValue(obj, path) {
+  let current = obj;
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || !(key in current)) {
+      return undefined;
+    }
+    current = current[key];
+  }
+  return current;
+}
+
+function pickNestedMessage(error) {
+  const paths = [
+    ['message'],
+    ['error'],
+    ['details'],
+    ['reason'],
+    ['response', 'data', 'message'],
+    ['response', 'data', 'error'],
+    ['response', 'message'],
+    ['data', 'message'],
+    ['data', 'error'],
+    ['nativeError', 'message'],
+    ['cause', 'message'],
+    ['userInfo', 'message'],
+    ['userInfo', 'localizedDescription'],
+  ];
+
+  for (const path of paths) {
+    const value = readPathValue(error, path);
+    if (typeof value === 'string' && value.trim()) {
+      return value.trim();
+    }
+  }
+  return '';
+}
+
 function extractErrorMessage(error) {
   if (typeof error === 'string') return error;
-  if (error instanceof Error) return error.message ?? '';
-  if (error && typeof error === 'object' && typeof error.message === 'string') {
-    return error.message;
+  if (error instanceof Error) {
+    const nested = pickNestedMessage(error);
+    return nested || (error.message ?? '');
+  }
+  if (error && typeof error === 'object') {
+    return pickNestedMessage(error);
   }
   return '';
 }
@@ -46,7 +86,7 @@ export function normalizeError(error, options = {}) {
     lower.includes('sign-in url')
   ) {
     message = 'Could not open sign-in. Please try again.';
-  } else if (raw) {
+  } else if (raw && raw !== '[object Object]') {
     message = raw;
   }
 
